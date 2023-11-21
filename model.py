@@ -15,6 +15,11 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from quantization import (
+    QuantizedLinear,
+    QuantizeConfig,
+)
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -32,9 +37,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = QuantizedLinear(config.n_embd, 3 * config.n_embd, qconfig=config.qconfig, bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = QuantizedLinear(config.n_embd, config.n_embd, qconfig=config.qconfig, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -79,9 +84,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = QuantizedLinear(config.n_embd, 4 * config.n_embd, qconfig=config.qconfig, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = QuantizedLinear(4 * config.n_embd, config.n_embd, qconfig=config.qconfig, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -114,6 +119,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    qconfig: QuantizeConfig = QuantizeConfig()
 
 class GPT(nn.Module):
 
@@ -328,3 +334,8 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+    def quantize(self):
+        for m in self.modules():
+            if isinstance(m, QuantizedLinear):
+                m.quantize()
