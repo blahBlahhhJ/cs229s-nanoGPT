@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from quantization import (
+from optimization.quantization import (
     QuantizedLinear,
     QuantizeConfig,
 )

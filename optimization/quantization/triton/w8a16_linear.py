@@ -1,5 +1,5 @@
 """
-https://github.com/ELS-RD/kernl/blob/main/src/kernl/implementations/linear_layer.py
+modified from https://github.com/ELS-RD/kernl/blob/main/src/kernl/implementations/linear_layer.py
 """
 
 from typing import Optional

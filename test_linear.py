@@ -1,6 +1,6 @@
 import torch
 
-from quantization import QuantizedLinear, QuantizeConfig
+from optimization.quantization import QuantizedLinear, QuantizeConfig
 
 fc = QuantizedLinear(256, 256, QuantizeConfig()).cuda()
 x = torch.rand(64, 256).cuda()

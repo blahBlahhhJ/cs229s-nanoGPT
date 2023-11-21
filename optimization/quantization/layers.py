@@ -6,7 +6,7 @@ from .util import (
     QuantizeConfig,
     Quantizer,
 )
-from .triton import w8a16_linear
+from optimization.quantization.triton import w8a16_linear
 
 
 class QuantizedLinear(nn.Linear):
