@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from optimization.fusion.triton import (
-    linear_bias_act
+    linear_bias_act,
 )
 
 
-class FusedLinear(nn.Linear):
+class FusedLinearBiasAct(nn.Linear):
     def __init__(self, in_features: int, out_features: int, fuse_gelu: bool = False, *args, **kwargs):
         super().__init__(in_features, out_features, *args, **kwargs)
 

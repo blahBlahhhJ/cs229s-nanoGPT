@@ -4,8 +4,8 @@ from optimization.quantization import QuantizedLinear, QuantizeConfig
 
 fc = QuantizedLinear(256, 256, QuantizeConfig()).cuda()
 x = torch.rand(64, 256).cuda()
-fc.to(torch.bfloat16)
-x = x.to(torch.bfloat16)
+fc.to(torch.float16)
+x = x.to(torch.float16)
 print('x', x[0, :10])
 print('fp16 w', fc.weight.data[0, :10])
 print('fp16 y', torch.round(fc(x), decimals=4)[0, :10])

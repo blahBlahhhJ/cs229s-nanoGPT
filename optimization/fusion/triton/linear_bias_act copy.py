@@ -328,9 +328,9 @@ class _linear_bias_act(torch.autograd.Function):
         Compute the derivative with respect to x, other tensors were not trainable inputs.
         """
         (weight, activation_inputs, inputs) = ctx.saved_tensors
-        trainable_weight = ctx.trainable_weight
-        trainable_bias = ctx.trainable_bias
-        activation_grad = ctx.activation
+        trainable_weight = ctx.trainable_weight,
+        trainable_bias = ctx.trainable_bias,
+        activation_grad = ctx.activation,
 
         # Make sure that we don't have to handle the stride over cols
         if not grad_out.is_contiguous():

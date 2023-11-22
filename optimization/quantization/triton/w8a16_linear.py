@@ -246,7 +246,7 @@ def w8a16_linear(
         HAS_BIAS=bias is not None,  # optional fused bias
         ACTIVATION=activation if not None else x,  # optional fused activation
         GROUP_M=8,  # speed optimization: group the programs
-        ACC_TYPE=tl.bfloat16,
+        ACC_TYPE=tl.float16,
     )
 
     outputs = outputs if x.ndim == 2 else outputs.reshape(x.shape[0], -1, N)
