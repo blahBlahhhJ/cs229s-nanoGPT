@@ -284,6 +284,10 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
+    # prune the model weights after training for 100 iterations
+    if iter_num >= 100:
+        model.prune_weight(0.1)
+
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
@@ -304,6 +308,9 @@ while True:
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    # disable the gradients because of the pruning
+    if iter_num >= 100:
+        model.prune_grad()
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
