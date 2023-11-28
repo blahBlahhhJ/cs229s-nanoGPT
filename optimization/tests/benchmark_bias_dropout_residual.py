@@ -16,12 +16,7 @@ from xformers.benchmarks.utils import TestCase, pretty_plot, pretty_print
 from optimization.fusion.functional import fused_bias_dropout_residual
 
 SHAPES = [
-    (8, 256, 512),
-    (8, 512, 1024),
-    (4, 1024, 1024),
-    (2, 2048, 2048),
-    (1, 2048, 12288),
-    (2, 4096, 4096),
+    (1, 1, 4096),
 ]
 
 P = 0.1
@@ -57,17 +52,16 @@ def bench_dropout(bias: bool, backward: bool):
             b = torch.rand(K, device=device, dtype=dtype, requires_grad=backward)
 
             def triton_dropout(x):
-                return fused_bias_dropout_residual(x, P, r, b if bias else None)
+                return fused_bias_dropout_residual(x, P, r, backward, b if bias else None)
             
-            @torch.jit.script
             def torch_dropout(x, bias: bool = bias, b: torch.Tensor = b, P: float = P, r: torch.Tensor = r):
                 if bias:
                     x = x + b
-                    out = torch.nn.functional.dropout(x, p=P, training=True)
+                    out = torch.nn.functional.dropout(x, p=P, training=backward)
                     out = r + out
                     return out
                 else:
-                    out = torch.nn.functional.dropout(x, p=P, training=True)
+                    out = torch.nn.functional.dropout(x, p=P, training=backward)
                     out = r + out
                     return out
 
@@ -123,5 +117,5 @@ def bench_dropout(bias: bool, backward: bool):
 
 
 for bw in [True, False]:
-    for bias in [True, False]:
+    for bias in [True]:
         bench_dropout(bias, bw)

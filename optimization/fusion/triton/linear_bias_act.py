@@ -382,6 +382,7 @@ def linear_bias_act(
     trainable_bias=True,
     save_activation_inputs=True,
 ):
+    # print(x.shape, weight.shape, bias.shape)
     return _linear_bias_act.apply(
         x,
         weight,

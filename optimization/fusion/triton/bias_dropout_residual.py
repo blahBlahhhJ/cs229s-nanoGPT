@@ -9,8 +9,8 @@ import triton
 import triton.language as tl
 
 
-BLOCK_M = 32
-BLOCK_N = 64  # NOTE: This should ideally be GPU dependent, big impact on perf
+BLOCK_M = 1
+BLOCK_N = 1024  # NOTE: This should ideally be GPU dependent, big impact on perf
 
 
 _configs = [
@@ -312,6 +312,8 @@ def bias_dropout_residual(
     """
     Apply dropout on the input tensor.
     Optionally add a bias, the computation will be fused.
+
+    GPT: (1,1,1024) for x and residual.
     """
 
     assert p <= 1.0 and p >= 0.0
