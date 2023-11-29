@@ -121,7 +121,7 @@ else:
 
     # simple benchmarking
     torch.cuda.synchronize()
-    for stage, num_steps in enumerate([2, 500]): # burnin, then benchmark
+    for stage, num_steps in enumerate([2, 10]): # burnin, then benchmark
         t0 = time.time()
         for k in range(num_steps):
             optimizer.zero_grad(set_to_none=True)
@@ -159,41 +159,57 @@ print("-------------------------------------------------------------------------
 print("Second task: inference latency")
 enc = tiktoken.get_encoding("gpt2")
 
-batch = 1
-ctx = torch.tensor(enc.encode("hello", allowed_special={"<|endoftext|>"}), dtype=torch.long, device=device).unsqueeze(0)
+for batch in [1, 12]:
+    ctx = torch.tensor(enc.encode("hello", allowed_special={"<|endoftext|>"}), dtype=torch.long, device=device).unsqueeze(0)
+    ctx = ctx.repeat(batch, 1)
+    times = []
 
-times = []
-for stage, num_steps in enumerate([10, 10]):
-    for i in range(num_steps):
-        torch.cuda.synchronize(device=None)
-        torch.manual_seed(i + seed)
+    for stage, num_steps in enumerate([10, 10]):
+        for i in range(num_steps):
+            torch.cuda.synchronize(device=None)
+            torch.manual_seed(i + seed)
 
-        t = time.time()
-        y = model.generate_kv(ctx, 128, 1.0, 1)
+            t = time.time()
+            y = model.generate_kv(ctx, 128, 1.0, 1)
+            if stage == 1:
+                times.append(128.0 / (time.time() - t))
+
+    print(f"inference_latency_{batch}", np.mean(times))
+    result[f"inference_latency_{batch}"] = np.mean(times)
+
+print("-----------------------------------------------------------------------------")
+print("Third task: training throughput")
+
+for batch_size in [4, 12]:
+    times = []
+    torch.cuda.synchronize()
+    for stage, num_steps in enumerate([2, 10]): # burnin, then benchmark
+        for k in range(num_steps):
+            optimizer.zero_grad(set_to_none=True)
+            X, Y = get_batch('train')
+            t0 = time.time()
+            with ctx:
+                logits, loss = model(X, Y)
+            loss.backward()
+            optimizer.step()
+            lossf = loss.item()
+            print(f"{k}/{num_steps} loss: {lossf:.4f}")
+            t1 = time.time()
+            dt = t1-t0
+            if stage == 1:
+                times.append(dt)
+        torch.cuda.synchronize()
+        mfu = model.estimate_mfu(batch_size * 1 * num_steps, dt)
         if stage == 1:
-            times.append(128.0 / (time.time() - t))
+            print(f"time per iteration: {dt/num_steps*1000:.4f}ms, MFU: {mfu*100:.2f}%")
+    print(f"training_throughput_{batch_size}", batch_size / np.mean(times))
+    result[f"training_throughput_{batch_size}"] = batch_size / np.mean(times)
 
-print("inference_latency_1", np.mean(times))
-result["inference_latency_1"] = np.mean(times)
-
-batch = 12
-ctx = torch.tensor(enc.encode("hello", allowed_special={"<|endoftext|>"}), dtype=torch.long, device=device).unsqueeze(0)
-ctx = ctx.repeat(batch, 1)
-
-times = []
-for stage, num_steps in enumerate([10, 10]):
-    for i in range(num_steps):
-        torch.cuda.synchronize(device=None)
-        torch.manual_seed(i + seed)
-
-        t = time.time()
-        y = model.generate_kv(ctx, 128, 1.0, 1)
-        if stage == 1:
-            times.append(batch * 128.0 / (time.time() - t))
-
-print("inference_latency_12", np.mean(times))
-result["inference_latency_12"] = np.mean(times)
+# now batch size should be 12
+batch_size = 12
 
 # -----------------------------------------------------------------------------------
-with open('result.json', 'w') as f:
+with open('results.json', 'w') as f:
+    print("save results to results.json")
+    print(result)
     json.dump(result, f)
