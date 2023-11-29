@@ -1,25 +1,22 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
-
 import math
-import inspect
 from dataclasses import dataclass
-from utils import find_layers
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
 
 from optimization.quantization import (
     QuantizedLinear,
     QuantizeConfig,
 )
+from optimization.fusion import (
+    FusedLinearBiasAct,
+    FusedLinearBiasDropoutResidual,
+)
+from optimization.util import (
+    OptimizationConfig
+)
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -32,18 +29,23 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.config = config
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = QuantizedLinear(config.n_embd, 3 * config.n_embd, qconfig=config.qconfig, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
-        self.c_proj = QuantizedLinear(config.n_embd, config.n_embd, qconfig=config.qconfig, bias=config.bias)
+        if self.config.oconfig.fuse_bias_dropout_residual:
+            self.c_proj = FusedLinearBiasDropoutResidual(config.n_embd, config.n_embd, bias=config.bias)
+        else:
+            self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = config.dropout
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
@@ -54,8 +56,17 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+            
+        batch_dim = 12
+        seq_dim = 512
+        self.seq_pos = 0
+        self.kv_enabled = True
 
-    def forward(self, x):
+        self.register_buffer("kv_cache", torch.empty((
+            2, batch_dim, self.n_head, seq_dim, self.n_embd // self.n_head
+        ), dtype=torch.float32), persistent=False)
+
+    def forward(self, x, residual):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -63,6 +74,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        if self.kv_enabled:
+            self.seq_pos = T
+            self.kv_cache[0, :B, :, :self.seq_pos, :] = k
+            self.kv_cache[1, :B, :, :self.seq_pos, :] = v
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -78,27 +94,78 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        if self.config.oconfig.fuse_bias_dropout_residual:
+            y = self.c_proj(y, residual)
+        else:
+            y = F.dropout(self.c_proj(y), self.resid_dropout, self.training) + residual
+
         return y
+    
+    def decode(self, x, residual):
+        if not self.kv_enabled:
+            raise ValueError("KV cache is not enabled!")
+        
+        B, T, C = x.size()
+
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        self.kv_cache[0, :B, :, self.seq_pos: self.seq_pos+T, :] = k
+        self.kv_cache[1, :B, :, self.seq_pos: self.seq_pos+T, :] = v
+        self.seq_pos += T
+        
+        k = self.kv_cache[0, :B, :, :self.seq_pos, :]
+        v = self.kv_cache[1, :B, :, :self.seq_pos, :]
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        if self.config.oconfig.fuse_bias_dropout_residual:
+            y = self.c_proj(y, residual)
+        else:
+            y = F.dropout(self.c_proj(y), self.resid_dropout, self.training) + residual
+        
+        return y
+
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = QuantizedLinear(config.n_embd, 4 * config.n_embd, qconfig=config.qconfig, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = QuantizedLinear(4 * config.n_embd, config.n_embd, qconfig=config.qconfig, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        self.config = config
+        # self.c_fc    = FusedLinearBiasAct(config.n_embd, 4 * config.n_embd, bias=config.bias, fuse_gelu=True)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        if self.config.oconfig.fuse_bias_dropout_residual:
+            self.c_proj = FusedLinearBiasDropoutResidual(4 * config.n_embd, config.n_embd, bias=config.bias)
+        else:
+            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = config.dropout
 
-    def forward(self, x):
+    def forward(self, x, residual):
+        # this computes gelu(linear(x) + bias)
         x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
+        x = F.gelu(x)
+
+        if self.config.oconfig.fuse_bias_dropout_residual:
+            x = self.c_proj(x, residual)
+        else:
+            x = F.dropout(self.c_proj(x), self.dropout, self.training) + residual
+
         return x
 
 class Block(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -107,10 +174,15 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = self.attn(self.ln_1(x), residual=x)
+        x = self.mlp(self.ln_2(x), residual=x)
         return x
-
+    
+    def decode(self, x):
+        x = self.attn.decode(self.ln_1(x), residual=x)
+        x = self.mlp(self.ln_2(x), residual=x)
+        return x
+    
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -121,6 +193,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     qconfig: QuantizeConfig = QuantizeConfig()
+    oconfig: OptimizationConfig = OptimizationConfig(fuse_bias_dropout_residual=False)
 
 class GPT(nn.Module):
 
@@ -153,6 +226,21 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    @property
+    def seq_pos(self):
+        return self.transformer.h[0].attn.seq_pos
+
+    @seq_pos.setter
+    def seq_pos(self, value):
+        for block in self.transformer.h:
+            block.attn.seq_pos = value
+
+    def enable_kv(self, use_kv=True):
+        self.seq_pos = 0 if use_kv else None
+        self.kv_enabled = use_kv
+        for block in self.transformer.h:
+            block.attn.kv_enabled = use_kv
 
     def get_num_params(self, non_embedding=True):
         """
@@ -198,6 +286,22 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
+    
+    def decode(self, idx):
+        device = idx.device
+        b, t = idx.size()
+        assert self.seq_pos + t <= self.config.block_size, f"Cannot forward sequence of lenggth {t}, block size is only {self.config.block_size}"
+
+        pos = torch.arange(self.seq_pos, self.seq_pos + t, dtype=torch.long, device=device)
+        pos_emb = self.transformer.wpe(pos).unsqueeze(0)
+        tok_emb = self.transformer.wte(idx)
+
+        x = tok_emb + pos_emb
+        for l in self.transformer.h:
+            x = l.decode(x)
+        x = self.transformer.ln_f(x)
+        x = self.lm_head(x)
+        return x
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -335,78 +439,43 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-
-
-    def prune_weight(self, sparsity=0.1, method="individual"):
-        """
-        Structured pruning. Remove model weights that are below a certain threshold.
-        This is useful for reducing the model size and inference latency.
-        """
-        """
-        GPT(
-            (transformer): ModuleDict(
-                (wte): Embedding(50257, 1024)
-                (wpe): Embedding(1024, 1024)
-                (drop): Dropout(p=0.0, inplace=False)
-                (h): ModuleList(
-                (0-23): 24 x Block(
-                    (ln_1): LayerNorm()
-                    (attn): CausalSelfAttention(
-                    (c_attn): Linear(in_features=1024, out_features=3072, bias=True)
-                    (c_proj): Linear(in_features=1024, out_features=1024, bias=True)
-                    (attn_dropout): Dropout(p=0.0, inplace=False)
-                    (resid_dropout): Dropout(p=0.0, inplace=False)
-                    )
-                    (ln_2): LayerNorm()
-                    (mlp): MLP(
-                    (c_fc): Linear(in_features=1024, out_features=4096, bias=True)
-                    (gelu): GELU(approximate='none')
-                    (c_proj): Linear(in_features=4096, out_features=1024, bias=True)
-                    (dropout): Dropout(p=0.0, inplace=False)
-                    )
-                )
-                )
-                (ln_f): LayerNorm()
-            )
-            (lm_head): Linear(in_features=1024, out_features=50257, bias=False)
-        )
-        """
-        blocks = self.transformer.h + [self.lm_head]
-        # for each block, prune mlp layers
-        for i in range(len(blocks)):
-            layers = find_layers(blocks[i])
-            for name in layers:
-                W = layers[name].weight.data
-                if method == "individual":
-                    W_abs = W.abs()
-                    # calculate the threshold value
-                    threshold = torch.topk(W_abs.view(-1), int(sparsity * W.numel()), largest=True)[0].min()
-                    W_mask = (W_abs <= threshold)
-                    W[W_mask] = 0
-                    print(f"pruning block{i}.{name} with threshold {threshold:.3e}, {W_mask.sum().item()}/{W.numel()} parameters pruned")
-                elif method == "l2norm":
-                    # it should be two dimensions, but just in case
-                    norms = torch.norm(W.view(W.size(0), -1), dim=1)
-                    # calculate the threshold value
-                    threshold = torch.topk(norms, int(sparsity * W.size(0)), largest=True)[0].min()
-                    W_mask = (norms <= threshold)
-                    W[W_mask] = 0
-                else:
-                    raise NotImplementedError(f"pruning method {method} not implemented")
-
+    
     @torch.no_grad()
-    def prune_grad(self):
-        """
-        Structured pruning. Set corresponding gradient to zero for model weights that are below a certain threshold.
-        """
-        blocks = self.transformer.h + [self.lm_head]
-        # for each block, prune mlp layers
-        for i in range(len(blocks)):
-            layers = find_layers(blocks[i])
-            for name in layers:
-                W = layers[name].weight.data
-                W_mask = (W == 0)
-                layers[name].weight.grad[W_mask] = 0
+    def generate_kv(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        b, t = idx.size()
+        result = torch.empty((b, t + max_new_tokens), dtype=torch.long, device=idx.device)
+        result[:, :t] = idx
+
+        logits, _ = self(idx)
+        logits = logits.squeeze(1) / temperature
+
+        if top_k == 1:
+            idx_next = logits.argmax(-1, keepdim=True)
+        else:
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('inf')
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+        
+        result[:, [t]] = idx_next
+
+        for i in range(1, max_new_tokens):
+            logits = self.decode(idx_next)
+            logits = logits.squeeze(1) / temperature
+
+            if top_k == 1:
+                idx_next = logits.argmax(-1, keepdim=True)
+            else:
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+
+            result[:, [t + i]] = idx_next
+        
+        return result
 
     def quantize(self):
         for m in self.modules():
