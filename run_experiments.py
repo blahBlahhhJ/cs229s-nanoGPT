@@ -9,6 +9,7 @@ import torch
 import json
 from optimization.model import GPTConfig, GPT
 import tiktoken
+from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
 result = dict()
@@ -22,7 +23,7 @@ seed = 1337
 gradient_accumulation_steps = 40
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 profile = False # use pytorch profiler, or just simple benchmarking?
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
@@ -43,6 +44,7 @@ if real_data:
     val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     start = 0
     def get_batch(split="train"):
+        global start
         if split == "train":
             data = train_data
         elif split == "val":
@@ -69,15 +71,22 @@ else:
     get_batch = lambda split: (x, y)
 
 # model init
-gptconf = GPTConfig(
-    block_size = block_size, # how far back does the model look? i.e. context size
-    n_layer = 12, n_head = 12, n_embd = 768, # size of the model
-    dropout = 0, # for determinism
-    bias = bias,
-)
-model = GPT(gptconf)
+# gptconf = GPTConfig(
+#     block_size = block_size, # how far back does the model look? i.e. context size
+#     n_layer = 12, n_head = 12, n_embd = 768, # size of the model
+#     dropout = 0, # for determinism
+#     bias = bias,
+# )
+# gptconf = GPTConfig(
+#     block_size = block_size, # how far back does the model look? i.e. context size
+#     n_layer = 24, n_head = 16, n_embd = 1024, # size of the model
+#     dropout = 0, # for determinism
+#     bias = bias,
+# )
+# model = GPT(gptconf)
+model = GPT.from_pretrained("gpt2-medium")
 model.to(device)
-
+model.enable_kv(False)
 optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
 
 if compile:
@@ -121,9 +130,9 @@ else:
 
     # simple benchmarking
     torch.cuda.synchronize()
-    for stage, num_steps in enumerate([2, 10]): # burnin, then benchmark
+    for stage, num_steps in enumerate([10, 500]): # burnin, then benchmark
         t0 = time.time()
-        for k in range(num_steps):
+        for k in tqdm(range(num_steps)):
             optimizer.zero_grad(set_to_none=True)
             for _ in range(gradient_accumulation_steps):
                 X, Y = get_batch('train')
@@ -143,8 +152,9 @@ else:
 # validation loss
 val_steps = (len(val_data)-1) // (batch_size * block_size) - 1
 batch_loss = []
+model.eval()
 with torch.no_grad():
-    for k in range(val_steps):
+    for k in tqdm(range(val_steps)):
         X, Y = get_batch('val')
         with ctx:
             logits, loss = model(X, Y)
@@ -157,34 +167,36 @@ result['loss'] = val_loss
 
 print("------------------------------------------------------------------------------------")
 print("Second task: inference latency")
+model.enable_kv(True)
 enc = tiktoken.get_encoding("gpt2")
 
 for batch in [1, 12]:
-    ctx = torch.tensor(enc.encode("hello", allowed_special={"<|endoftext|>"}), dtype=torch.long, device=device).unsqueeze(0)
-    ctx = ctx.repeat(batch, 1)
+    prompt = torch.tensor(enc.encode("hello", allowed_special={"<|endoftext|>"}), dtype=torch.long, device=device).unsqueeze(0)
+    prompt = prompt.repeat(batch, 1)
     times = []
 
     for stage, num_steps in enumerate([10, 10]):
-        for i in range(num_steps):
+        for i in tqdm(range(num_steps)):
             torch.cuda.synchronize(device=None)
             torch.manual_seed(i + seed)
 
             t = time.time()
-            y = model.generate_kv(ctx, 128, 1.0, 1)
+            y = model.generate_kv(prompt, 128, 1.0, 1)
             if stage == 1:
-                times.append(128.0 / (time.time() - t))
+                times.append(batch * 128.0 / (time.time() - t))
 
     print(f"inference_latency_{batch}", np.mean(times))
     result[f"inference_latency_{batch}"] = np.mean(times)
 
 print("-----------------------------------------------------------------------------")
 print("Third task: training throughput")
-
+model.train()
+model.enable_kv(False)
 for batch_size in [4, 12]:
     times = []
     torch.cuda.synchronize()
     for stage, num_steps in enumerate([2, 10]): # burnin, then benchmark
-        for k in range(num_steps):
+        for k in tqdm(range(num_steps)):
             optimizer.zero_grad(set_to_none=True)
             X, Y = get_batch('train')
             t0 = time.time()
