@@ -193,7 +193,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     qconfig: QuantizeConfig = QuantizeConfig()
-    oconfig: OptimizationConfig = OptimizationConfig(fuse_bias_dropout_residual=False)
+    oconfig: OptimizationConfig = OptimizationConfig(fuse_bias_dropout_residual=False, fuse_linear_bias_act=False)
 
 class GPT(nn.Module):
 

@@ -7,7 +7,8 @@ import numpy as np
 import time
 import torch
 import json
-from model import GPTConfig, GPT
+from optimization.model import GPTConfig, GPT
+import tiktoken
 
 # -----------------------------------------------------------------------------
 result = dict()
@@ -83,8 +84,8 @@ if compile:
     print("Compiling model...")
     model = torch.compile(model) # pytorch 2.0
 
-#---------------------------------------------------------------------------------
-# First task: train the model and get validation loss
+print("---------------------------------------------------------------------------------")
+print("First task: train the model and get validation loss")
 
 if profile:
     # useful docs on pytorch profiler:
@@ -154,14 +155,44 @@ val_loss = np.mean(batch_loss)
 print(f"Validation loss: {val_loss:.4f}")
 result['loss'] = val_loss
 
-# ------------------------------------------------------------------------------------
-# Second task: inference latency
+print("------------------------------------------------------------------------------------")
+print("Second task: inference latency")
+enc = tiktoken.get_encoding("gpt2")
 
+batch = 1
+ctx = torch.tensor(enc.encode("hello", allowed_special={"<|endoftext|>"}), dtype=torch.long, device=device).unsqueeze(0)
 
+times = []
+for stage, num_steps in enumerate([10, 10]):
+    for i in range(num_steps):
+        torch.cuda.synchronize(device=None)
+        torch.manual_seed(i + seed)
 
+        t = time.time()
+        y = model.generate_kv(ctx, 128, 1.0, 1)
+        if stage == 1:
+            times.append(128.0 / (time.time() - t))
 
+print("inference_latency_1", np.mean(times))
+result["inference_latency_1"] = np.mean(times)
 
+batch = 12
+ctx = torch.tensor(enc.encode("hello", allowed_special={"<|endoftext|>"}), dtype=torch.long, device=device).unsqueeze(0)
+ctx = ctx.repeat(batch, 1)
 
+times = []
+for stage, num_steps in enumerate([10, 10]):
+    for i in range(num_steps):
+        torch.cuda.synchronize(device=None)
+        torch.manual_seed(i + seed)
+
+        t = time.time()
+        y = model.generate_kv(ctx, 128, 1.0, 1)
+        if stage == 1:
+            times.append(batch * 128.0 / (time.time() - t))
+
+print("inference_latency_12", np.mean(times))
+result["inference_latency_12"] = np.mean(times)
 
 # -----------------------------------------------------------------------------------
 with open('result.json', 'w') as f:
