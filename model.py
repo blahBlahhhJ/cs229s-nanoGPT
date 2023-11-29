@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from utils import find_layers
 
 import torch
 import torch.nn as nn
@@ -334,6 +335,78 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+    def prune_weight(self, sparsity=0.1, method="individual"):
+        """
+        Structured pruning. Remove model weights that are below a certain threshold.
+        This is useful for reducing the model size and inference latency.
+        """
+        """
+        GPT(
+            (transformer): ModuleDict(
+                (wte): Embedding(50257, 1024)
+                (wpe): Embedding(1024, 1024)
+                (drop): Dropout(p=0.0, inplace=False)
+                (h): ModuleList(
+                (0-23): 24 x Block(
+                    (ln_1): LayerNorm()
+                    (attn): CausalSelfAttention(
+                    (c_attn): Linear(in_features=1024, out_features=3072, bias=True)
+                    (c_proj): Linear(in_features=1024, out_features=1024, bias=True)
+                    (attn_dropout): Dropout(p=0.0, inplace=False)
+                    (resid_dropout): Dropout(p=0.0, inplace=False)
+                    )
+                    (ln_2): LayerNorm()
+                    (mlp): MLP(
+                    (c_fc): Linear(in_features=1024, out_features=4096, bias=True)
+                    (gelu): GELU(approximate='none')
+                    (c_proj): Linear(in_features=4096, out_features=1024, bias=True)
+                    (dropout): Dropout(p=0.0, inplace=False)
+                    )
+                )
+                )
+                (ln_f): LayerNorm()
+            )
+            (lm_head): Linear(in_features=1024, out_features=50257, bias=False)
+        )
+        """
+        blocks = self.transformer.h + [self.lm_head]
+        # for each block, prune mlp layers
+        for i in range(len(blocks)):
+            layers = find_layers(blocks[i])
+            for name in layers:
+                W = layers[name].weight.data
+                if method == "individual":
+                    W_abs = W.abs()
+                    # calculate the threshold value
+                    threshold = torch.topk(W_abs.view(-1), int(sparsity * W.numel()), largest=True)[0].min()
+                    W_mask = (W_abs <= threshold)
+                    W[W_mask] = 0
+                    print(f"pruning block{i}.{name} with threshold {threshold:.3e}, {W_mask.sum().item()}/{W.numel()} parameters pruned")
+                elif method == "l2norm":
+                    # it should be two dimensions, but just in case
+                    norms = torch.norm(W.view(W.size(0), -1), dim=1)
+                    # calculate the threshold value
+                    threshold = torch.topk(norms, int(sparsity * W.size(0)), largest=True)[0].min()
+                    W_mask = (norms <= threshold)
+                    W[W_mask] = 0
+                else:
+                    raise NotImplementedError(f"pruning method {method} not implemented")
+
+    @torch.no_grad()
+    def prune_grad(self):
+        """
+        Structured pruning. Set corresponding gradient to zero for model weights that are below a certain threshold.
+        """
+        blocks = self.transformer.h + [self.lm_head]
+        # for each block, prune mlp layers
+        for i in range(len(blocks)):
+            layers = find_layers(blocks[i])
+            for name in layers:
+                W = layers[name].weight.data
+                W_mask = (W == 0)
+                layers[name].weight.grad[W_mask] = 0
 
     def quantize(self):
         for m in self.modules():
