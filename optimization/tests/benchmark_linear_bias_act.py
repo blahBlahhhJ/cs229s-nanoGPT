@@ -16,10 +16,10 @@ from xformers.benchmarks.utils import TestCase, pretty_plot, pretty_print
 from optimization.fusion.layers import FusedLinearBiasAct
 
 SHAPES = [
-    (4, 512, 1024, 4096),
-    (2, 512, 4096, 1024),
-    (2, 512, 1024, 3072),
-    (2, 512, 1024, 1024),
+    (12, 1, 1024, 4096),
+    (1, 1, 1024, 4096),
+    # (1, 1, 1024, 3072),
+    # (1, 1, 1024, 1024),
 ]
 
 # Switch PyTorch to TF32 accumulations, Triton does that also
@@ -68,7 +68,7 @@ def bench_linear(activations: List[Optional[bool]]):
     device = torch.device("cuda")
 
     for dtype in [
-        # torch.float32,
+        torch.float32,
         torch.float16,
     ]:
         for backward in [True, False]:
@@ -76,10 +76,13 @@ def bench_linear(activations: List[Optional[bool]]):
             for activation in activations:
                 results: Dict[str, Any] = {}
 
-                for bias in [False, True]:
+                for bias in [True]:
                     for B, M, K, D in SHAPES:
                         a = torch.rand(
                             B, M, K, device=device, dtype=dtype, requires_grad=backward
+                        )
+                        r = torch.rand(
+                            B, M, D, device=device, dtype=dtype, requires_grad=backward
                         )
 
                         # Pytorch linear layer + activation
@@ -94,7 +97,7 @@ def bench_linear(activations: List[Optional[bool]]):
 
                         def torch_step(x):
                             if activation:
-                                y = torch.nn.functional.gelu(torch_linear(x))
+                                y = torch.nn.functional.gelu(torch_linear(x)) + r
                             else:
                                 y = torch_linear(x)
                             if backward:
@@ -158,5 +161,5 @@ def bench_linear(activations: List[Optional[bool]]):
                 # pretty_plot(results, title, "TFlops/s", dash_key="pytorch")
 
 
-activations = [True, False]  # type: ignore
+activations = [True]  # type: ignore
 bench_linear(activations)  # type: ignore

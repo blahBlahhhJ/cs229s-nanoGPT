@@ -52,14 +52,14 @@ def benchmark(model, ctx):
     for i in range(1):
         model.generate_kv(ctx, 128, 0.4, 200)
 
-    torch.cuda.synchronize(device=None)
-    t = time.time()
-    for i in range(num_samples):
-        torch.manual_seed(i + seed)
-        y = model.generate(ctx, 128, 0.4, 200)
-    fp32t = time.time() - t
-    print(enc.decode(y[0].tolist()))
-    print('-----------------------------------')
+    # torch.cuda.synchronize(device=None)
+    # t = time.time()
+    # for i in range(num_samples):
+    #     torch.manual_seed(i + seed)
+    #     y = model.generate(ctx, 128, 0.4, 200)
+    # fp32t = time.time() - t
+    # print(enc.decode(y[0].tolist()))
+    # print('-----------------------------------')
 
     torch.cuda.synchronize(device=None)
     t = time.time()
@@ -70,17 +70,16 @@ def benchmark(model, ctx):
     print(enc.decode(y[0].tolist()))
     print('-----------------------------------')
 
-    # cast to fp16/bf16
     model.to(ptdtype)
 
-    torch.cuda.synchronize(device=None)
-    t = time.time()
-    for i in range(num_samples):
-        torch.manual_seed(i + seed)
-        y = model.generate(ctx, 128, 0.4, 200)
-    fp16t = time.time() - t
-    print(enc.decode(y[0].tolist()))
-    print('-----------------------------------')
+    # torch.cuda.synchronize(device=None)
+    # t = time.time()
+    # for i in range(num_samples):
+    #     torch.manual_seed(i + seed)
+    #     y = model.generate(ctx, 128, 0.4, 200)
+    # fp16t = time.time() - t
+    # print(enc.decode(y[0].tolist()))
+    # print('-----------------------------------')
 
     torch.cuda.synchronize(device=None)
     t = time.time()
@@ -103,10 +102,29 @@ def benchmark(model, ctx):
     # print(enc.decode(y[0].tolist()))
     # print('-----------------------------------')
 
-    print('fp32:', fp32t/num_samples)
+    # print('fp32:', fp32t/num_samples)
     print('fp32_kv:', fp32t_kv/num_samples)
-    print('fp16:', fp16t/num_samples)
+    # print('fp16:', fp16t/num_samples)
     print('fp16_kv:', fp16t_kv/num_samples)
     # print('uint8:', uint8t/num_samples)
+    pass
 
 benchmark(model, ctx)
+
+# wait, warmup, active = 1, 1, 1
+# num_steps = wait + warmup + active
+# with torch.profiler.profile(
+#     schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
+#     on_trace_ready=torch.profiler.tensorboard_trace_handler('./bench_log/bdr'),
+#     record_shapes=True,
+#     profile_memory=True,
+#     with_stack=False, # incurs an additional overhead, disable if not needed
+#     with_flops=True,
+#     with_modules=False, # only for torchscript models atm
+# ) as prof:
+
+#     for i in range(num_steps):
+#         torch.manual_seed(i + seed)
+#         y = model.generate_kv(ctx, 128, 0.4, 200)
+
+#         prof.step() # notify the profiler at end of each step

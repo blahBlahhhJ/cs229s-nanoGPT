@@ -11,7 +11,10 @@ from optimization.quantization import (
 )
 from optimization.fusion import (
     FusedLinearBiasAct,
-    fused_bias_dropout_residual,
+    FusedLinearBiasDropoutResidual,
+)
+from optimization.util import (
+    OptimizationConfig
 )
 
 
@@ -32,10 +35,14 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.config = config
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        if self.config.oconfig.fuse_bias_dropout_residual:
+            self.c_proj = FusedLinearBiasDropoutResidual(config.n_embd, config.n_embd, bias=config.bias)
+        else:
+            self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = config.dropout
@@ -87,8 +94,11 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        y = F.linear(y, self.c_proj.weight)
-        y = fused_bias_dropout_residual(y, self.resid_dropout, residual, self.training, self.c_proj.bias)
+        if self.config.oconfig.fuse_bias_dropout_residual:
+            y = self.c_proj(y, residual)
+        else:
+            y = F.dropout(self.c_proj(y), self.resid_dropout, self.training) + residual
+
         return y
     
     def decode(self, x, residual):
@@ -122,8 +132,11 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        y = F.linear(y, self.c_proj.weight)
-        y = fused_bias_dropout_residual(y, self.resid_dropout, residual, self.training, self.c_proj.bias)
+        if self.config.oconfig.fuse_bias_dropout_residual:
+            y = self.c_proj(y, residual)
+        else:
+            y = F.dropout(self.c_proj(y), self.resid_dropout, self.training) + residual
+        
         return y
 
 
@@ -131,19 +144,25 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
         # self.c_fc    = FusedLinearBiasAct(config.n_embd, 4 * config.n_embd, bias=config.bias, fuse_gelu=True)
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        if self.config.oconfig.fuse_bias_dropout_residual:
+            self.c_proj = FusedLinearBiasDropoutResidual(4 * config.n_embd, config.n_embd, bias=config.bias)
+        else:
+            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = config.dropout
 
     def forward(self, x, residual):
         # this computes gelu(linear(x) + bias)
         x = self.c_fc(x)
         x = F.gelu(x)
-        # this computes linear(x)
-        x = F.linear(x, self.c_proj.weight)
-        # this computes residual + dropout(x + bias)
-        x = fused_bias_dropout_residual(x, self.dropout, residual, self.training, self.c_proj.bias)
+
+        if self.config.oconfig.fuse_bias_dropout_residual:
+            x = self.c_proj(x, residual)
+        else:
+            x = F.dropout(self.c_proj(x), self.dropout, self.training) + residual
+
         return x
 
 class Block(nn.Module):
@@ -174,6 +193,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     qconfig: QuantizeConfig = QuantizeConfig()
+    oconfig: OptimizationConfig = OptimizationConfig(fuse_bias_dropout_residual=False)
 
 class GPT(nn.Module):
 

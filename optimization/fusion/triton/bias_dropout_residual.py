@@ -3,7 +3,6 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import custom_bwd, custom_fwd
 
 import triton
 import triton.language as tl
@@ -78,7 +77,10 @@ def kernel_fw(
 
     # optionally apply a fused bias
     if USE_BIAS:
-        x += bias
+        if TRAINING:
+            x += bias
+        else:
+            x += bias + residual
 
     if TRAINING:
         # get the random keep mask
@@ -90,8 +92,9 @@ def kernel_fw(
         # prune and normalize in one go
         keep = tl.view(keep_mask, x.shape)
         x = tl.where(keep, (x * p_scale).to(x.dtype), 0.)
-
-    output = x + residual
+        output = x + residual
+    else:
+        output = x
 
     tl.store(y_ptrs, output, mask=block_mask)  # output
 
@@ -176,15 +179,15 @@ def kernel_bw(
 
 class _bias_dropout_residual(torch.autograd.Function):
     @staticmethod
-    @custom_fwd(cast_inputs=torch.float16)
     def forward(ctx, x, p, bias, residual, trainable_bias, training):
         # Soft-flatten an hypothetical 3rd dimension
-        x_ = x.reshape(-1, x.shape[-1]).contiguous()
-        y = torch.empty_like(x_)
-        M, N = x_.shape
+        y = torch.empty_like(x)
+        M, N = 1, x.shape[-1]
+        for s in x.shape[:-1]:
+            M *= s
 
         assert bias is None or (bias.dtype == x.dtype and bias.shape[0] == N)
-        assert p > 0.0
+        assert not training or p > 0.0
 
         def grid(meta):
             return (
@@ -205,7 +208,7 @@ class _bias_dropout_residual(torch.autograd.Function):
         bias_ptr = bias if bias is not None else x_  # Possibly not being used
 
         kernel_fw[grid](
-            y, x_,
+            y, x,
             bias_ptr,
             seeds,
             residual,
@@ -226,10 +229,9 @@ class _bias_dropout_residual(torch.autograd.Function):
         ctx.training = training
         ctx.p = p
 
-        return y.reshape_as(x)
+        return y
 
     @staticmethod
-    @custom_bwd
     def backward(
         ctx, grad_out
     ):  # pragma: no cover  # This is covered, but called from C++ and not tracked
@@ -322,9 +324,9 @@ def bias_dropout_residual(
         return torch.zeros_like(x)
 
     # Micro optim, skip dropout
-    if p == 0.0:
-        x = x + bias + residual if bias is not None else x + residual
-        return x
+    # if p == 0.0:
+    #     x = x + bias + residual if bias is not None else x + residual
+    #     return x
 
     # The normal triton enabled codepath
     return _bias_dropout_residual.apply(

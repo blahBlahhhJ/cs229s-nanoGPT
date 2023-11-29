@@ -1,5 +1,6 @@
 from .layers import (
     FusedLinearBiasAct,
+    FusedLinearBiasDropoutResidual,
 )
 
 from .functional import (

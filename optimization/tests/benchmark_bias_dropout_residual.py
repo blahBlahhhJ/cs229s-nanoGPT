@@ -16,10 +16,11 @@ from xformers.benchmarks.utils import TestCase, pretty_plot, pretty_print
 from optimization.fusion.functional import fused_bias_dropout_residual
 
 SHAPES = [
-    (1, 1, 4096),
+    (12, 1, 1024, 1024),
+    (12, 1, 4096, 1024),
 ]
 
-P = 0.1
+P = 0.0
 
 
 def to_gbs_fw(a, ms, bias):
@@ -42,28 +43,24 @@ def bench_dropout(bias: bool, backward: bool):
     ]:
         results: Dict[str, Any] = {}
 
-        for B, M, K in SHAPES:
+        for B, M, k, K in SHAPES:
+            l = torch.nn.Linear(k, K, bias=bias, device=device, dtype=dtype)
             a = torch.rand(
-                (B, M, K), device=device, dtype=dtype, requires_grad=backward
+                (B, M, k), device=device, dtype=dtype, requires_grad=backward
             )
             r = torch.rand(
                 (B, M, K), device=device, dtype=dtype, requires_grad=backward
             )
-            b = torch.rand(K, device=device, dtype=dtype, requires_grad=backward)
 
             def triton_dropout(x):
-                return fused_bias_dropout_residual(x, P, r, backward, b if bias else None)
+                x = torch.nn.functional.linear(x, l.weight)
+                return fused_bias_dropout_residual(x, P, r, backward, l.bias)
             
-            def torch_dropout(x, bias: bool = bias, b: torch.Tensor = b, P: float = P, r: torch.Tensor = r):
-                if bias:
-                    x = x + b
-                    out = torch.nn.functional.dropout(x, p=P, training=backward)
-                    out = r + out
-                    return out
-                else:
-                    out = torch.nn.functional.dropout(x, p=P, training=backward)
-                    out = r + out
-                    return out
+            def torch_dropout(x, bias: bool = bias, P: float = P, r: torch.Tensor = r, training: bool = backward):
+                x = l(x)
+                out = torch.nn.functional.dropout(x, p=P, training=training)
+                out = r + out
+                return out
 
 
             def torch_step(x):
@@ -95,9 +92,9 @@ def bench_dropout(bias: bool, backward: bool):
                 ),
             ]:
                 time = triton.testing.do_bench(
-                    lambda: testcase.function(a), grad_to_none=[a, b]
+                    lambda: testcase.function(a), grad_to_none=[a, l.bias]
                 )
-                key = f"B={B}, M={M}, K={K}"
+                key = f"B={B}, M={M}, k={k}"
                 if key not in results:
                     results[key] = {}
 
@@ -116,6 +113,6 @@ def bench_dropout(bias: bool, backward: bool):
         # )
 
 
-for bw in [True, False]:
+for bw in [False]:
     for bias in [True]:
         bench_dropout(bias, bw)
