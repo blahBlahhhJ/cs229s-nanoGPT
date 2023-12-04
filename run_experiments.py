@@ -86,7 +86,6 @@ else:
 # model = GPT(gptconf)
 model = GPT.from_pretrained("gpt2-medium")
 model.to(device)
-model.enable_kv(False)
 optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
 
 if compile:
@@ -167,7 +166,6 @@ result['loss'] = val_loss
 
 print("------------------------------------------------------------------------------------")
 print("Second task: inference latency")
-model.enable_kv(True)
 enc = tiktoken.get_encoding("gpt2")
 
 for batch in [1, 12]:
@@ -191,7 +189,6 @@ for batch in [1, 12]:
 print("-----------------------------------------------------------------------------")
 print("Third task: training throughput")
 model.train()
-model.enable_kv(False)
 for batch_size in [4, 12]:
     times = []
     torch.cuda.synchronize()

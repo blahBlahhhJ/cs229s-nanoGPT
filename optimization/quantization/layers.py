@@ -9,31 +9,38 @@ from .util import (
 from optimization.quantization.triton import w8a16_linear
 
 
-class QuantizedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, qconfig: QuantizeConfig, *args, **kwargs):
-        super().__init__(in_features, out_features, *args, **kwargs)
+class QuantizedLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, qconfig: QuantizeConfig):
+        super().__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
 
         self.qconfig = qconfig
-        self.quantizer = Quantizer(qconfig)  # hardcode fp16
-        self.quantized = False  # lazy quantization
+        self.quantizer = Quantizer(qconfig)  # default to fp16
 
-        self.register_buffer('scale', None, persistent=False)
-        self.register_buffer('zero_point', None, persistent=False)
+        self.register_buffer('weight', torch.empty(
+            (out_features, in_features), 
+            dtype=self.quantizer.quantized_dtype
+        ))
+        self.register_buffer('bias', torch.empty(
+            (out_features,),
+            dtype=self.qconfig.dtype
+        ))
+        self.register_buffer('scale', torch.ones(
+            (out_features * in_features // self.qconfig.group_size, 1),
+            dtype=self.qconfig.dtype
+        ))
+        self.register_buffer('zero_point', None)
 
-    def quantize(self):
-        self.weight.data, self.scale, self.zero_point = self.quantizer.quantize(self.weight.data)
-        self.quantized = True
+    def quantize(self, weight, bias=None):
+        self.weight, self.scale, self.zero_point = self.quantizer.quantize(weight)
+        if bias:
+            self.bias = bias
 
-    def forward(self, input, triton=False):
-        if self.quantized:
-            if self.qconfig.sym and triton:
-                weight = self.quantizer.cast_quantized_to_real_type(self.weight.data)
-                res = w8a16_linear(input, weight, scale=self.scale, bias=self.bias, activation="")
-            else:
-                dequantized_weight = self.quantizer.dequantize(self.weight.data, self.scale, self.zero_point)
-                res = F.linear(input, dequantized_weight, bias=self.bias)
-            return res
-        else:
-            return super().forward(input)
+    def forward(self, input):
+        dequantized_weight = self.quantizer.dequantize(self.weight, self.scale, self.zero_point)
+        res = F.linear(input, dequantized_weight, bias=self.bias)
+        return res
         
         

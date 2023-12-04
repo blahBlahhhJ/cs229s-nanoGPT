@@ -9,13 +9,16 @@ import torch.nn.functional as F
 from optimization.quantization import (
     QuantizedLinear,
     QuantizeConfig,
+    Quantizer,
 )
 from optimization.fusion import (
     FusedLinearBiasAct,
     FusedLinearBiasDropoutResidual,
 )
 from optimization.util import (
-    OptimizationConfig
+    OptimizationConfig,
+    prefill,
+    decode_one_token,
 )
 
 
@@ -38,10 +41,15 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.config = config
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        if self.config.qconfig.quantize_from_init:
+            self.c_attn = QuantizedLinear(config.n_embd, 3 * config.n_embd, self.config.qconfig)
+        else:
+            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
         if self.config.oconfig.fuse_bias_dropout_residual:
             self.c_proj = FusedLinearBiasDropoutResidual(config.n_embd, config.n_embd, bias=config.bias)
+        elif self.config.qconfig.quantize_from_init:
+            self.c_proj = QuantizedLinear(config.n_embd, config.n_embd, self.config.qconfig)
         else:
             self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -58,13 +66,14 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
             
-        batch_dim = 12
+        batch_dim = 1
         seq_dim = 512
-        self.seq_pos = 0
-        self.kv_enabled = True
 
-        self.register_buffer("kv_cache", torch.empty((
-            2, batch_dim, self.n_head, seq_dim, self.n_embd // self.n_head
+        self.register_buffer("k_cache", torch.empty((
+            batch_dim, self.n_head, seq_dim, self.n_embd // self.n_head
+        ), dtype=torch.float32), persistent=False)
+        self.register_buffer("v_cache", torch.empty((
+            batch_dim, self.n_head, seq_dim, self.n_embd // self.n_head
         ), dtype=torch.float32), persistent=False)
 
     def forward(self, x, residual):
@@ -75,11 +84,6 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        if self.kv_enabled:
-            self.seq_pos = T
-            self.kv_cache[0, :B, :, :self.seq_pos, :] = k
-            self.kv_cache[1, :B, :, :self.seq_pos, :] = v
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -102,10 +106,7 @@ class CausalSelfAttention(nn.Module):
 
         return y
     
-    def decode(self, x, residual):
-        if not self.kv_enabled:
-            raise ValueError("KV cache is not enabled!")
-        
+    def decode(self, x, residual, mask, pos):
         B, T, C = x.size()
 
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
@@ -113,17 +114,16 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        self.kv_cache[0, :B, :, self.seq_pos: self.seq_pos+T, :] = k
-        self.kv_cache[1, :B, :, self.seq_pos: self.seq_pos+T, :] = v
-        self.seq_pos += T
+        self.k_cache[:B, :, pos, :] = k
+        self.v_cache[:B, :, pos, :] = v
         
-        k = self.kv_cache[0, :B, :, :self.seq_pos, :]
-        v = self.kv_cache[1, :B, :, :self.seq_pos, :]
+        k = self.kv_cache
+        v = self.kv_cache
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -147,9 +147,14 @@ class MLP(nn.Module):
         super().__init__()
         self.config = config
         # self.c_fc    = FusedLinearBiasAct(config.n_embd, 4 * config.n_embd, bias=config.bias, fuse_gelu=True)
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        if self.config.qconfig.quantize_from_init:
+            self.c_fc    = QuantizedLinear(config.n_embd, 4 * config.n_embd, self.config.qconfig)
+        else:
+            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         if self.config.oconfig.fuse_bias_dropout_residual:
             self.c_proj = FusedLinearBiasDropoutResidual(4 * config.n_embd, config.n_embd, bias=config.bias)
+        elif self.config.qconfig.quantize_from_init:
+            self.c_proj  = QuantizedLinear(4 * config.n_embd, config.n_embd, self.config.qconfig)
         else:
             self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = config.dropout
@@ -179,8 +184,8 @@ class Block(nn.Module):
         x = self.mlp(self.ln_2(x), residual=x)
         return x
     
-    def decode(self, x):
-        x = self.attn.decode(self.ln_1(x), residual=x)
+    def decode(self, x, mask, pos):
+        x = self.attn.decode(self.ln_1(x), residual=x, mask=mask, pos=pos)
         x = self.mlp(self.ln_2(x), residual=x)
         return x
     
@@ -194,7 +199,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     qconfig: QuantizeConfig = QuantizeConfig()
-    oconfig: OptimizationConfig = OptimizationConfig(fuse_bias_dropout_residual=False, fuse_linear_bias_act=False)
+    oconfig: OptimizationConfig = OptimizationConfig()
 
 class GPT(nn.Module):
 
@@ -203,6 +208,10 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.quantizer = Quantizer(self.config.qconfig)
+
+        seq_dim = 512
+        self.causal_mask = torch.tril(torch.ones(seq_dim, seq_dim, dtype=torch.bool))
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -211,7 +220,10 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        if self.config.qconfig.quantize_from_init:
+            self.lm_head = QuantizedLinear(config.n_embd, config.vocab_size, self.config.qconfig)
+        else:
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -227,21 +239,6 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-
-    @property
-    def seq_pos(self):
-        return self.transformer.h[0].attn.seq_pos
-
-    @seq_pos.setter
-    def seq_pos(self, value):
-        for block in self.transformer.h:
-            block.attn.seq_pos = value
-
-    def enable_kv(self, use_kv=True):
-        self.seq_pos = 0 if use_kv else None
-        self.kv_enabled = use_kv
-        for block in self.transformer.h:
-            block.attn.kv_enabled = use_kv
 
     def get_num_params(self, non_embedding=True):
         """
@@ -272,9 +269,10 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        mask = self.causal_mask[None, None, pos]
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, mask)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -288,18 +286,18 @@ class GPT(nn.Module):
 
         return logits, loss
     
-    def decode(self, idx):
-        device = idx.device
-        b, t = idx.size()
-        assert self.seq_pos + t <= self.config.block_size, f"Cannot forward sequence of lenggth {t}, block size is only {self.config.block_size}"
-
-        pos = torch.arange(self.seq_pos, self.seq_pos + t, dtype=torch.long, device=device)
+    def decode(self, idx, pos):
         pos_emb = self.transformer.wpe(pos).unsqueeze(0)
         tok_emb = self.transformer.wte(idx)
+        mask = self.causal_mask[None, None, pos]
 
         x = tok_emb + pos_emb
         for l in self.transformer.h:
-            x = l.decode(x)
+            x = l.decode(x, mask, pos)
+
+        if x.shape[1] != 1:
+            x = x[:, [-1], :]
+        
         x = self.transformer.ln_f(x)
         x = self.lm_head(x)
         return x
@@ -320,7 +318,7 @@ class GPT(nn.Module):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
+        # assert all(k == 'dropout' for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -341,6 +339,11 @@ class GPT(nn.Module):
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
+
+        if 'quantize_from_init' in override_args:
+            print(f"overriding quantize_from_init to {override_args['quantize_from_init']}")
+            config.qconfig.quantize_from_init = override_args['quantize_from_init']
+
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
@@ -357,13 +360,19 @@ class GPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        # assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
                 assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
+                if config.qconfig.quantize_from_init:
+                    with torch.no_grad():
+                        weight = sd_hf[k].t()
+                        weight_key, scale_key, zero_point_key = k, k[:-6] + 'scale', k[:-6] + 'zero_point'
+                        sd[weight_key], sd[scale_key], sd[zero_point_key] = model.quantizer.quantize(weight)
+                else:
+                    with torch.no_grad():
+                        sd[k].copy_(sd_hf[k].t())
             else:
                 # vanilla copy over the other parameters
                 assert sd_hf[k].shape == sd[k].shape
@@ -443,42 +452,20 @@ class GPT(nn.Module):
     
     @torch.no_grad()
     def generate_kv(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        device = idx.device
         b, t = idx.size()
-        result = torch.empty((b, t + max_new_tokens), dtype=torch.long, device=idx.device)
+        result = torch.empty((b, t + max_new_tokens), dtype=torch.long, device=device)
         result[:, :t] = idx
 
-        logits, _ = self(idx)
-        logits = logits.squeeze(1) / temperature
-
-        if top_k == 1:
-            idx_next = logits.argmax(-1, keepdim=True)
-        else:
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('inf')
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+        pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
+        idx_next = prefill(self, idx, pos, temperature, top_k)
         
         result[:, [t]] = idx_next
 
         for i in range(1, max_new_tokens):
-            logits = self.decode(idx_next)
-            logits = logits.squeeze(1) / temperature
-
-            if top_k == 1:
-                idx_next = logits.argmax(-1, keepdim=True)
-            else:
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('inf')
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
+            pos = torch.tensor([t + i], dtype=torch.long, device=device)
+            idx_next = decode_one_token(self, idx, pos, temperature, top_k)
 
             result[:, [t + i]] = idx_next
         
         return result
-
-    def quantize(self):
-        for m in self.modules():
-            if isinstance(m, QuantizedLinear):
-                m.quantize()
