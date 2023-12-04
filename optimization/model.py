@@ -65,15 +65,18 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
-            
-        batch_dim = 1
-        seq_dim = 512
 
         self.register_buffer("k_cache", torch.empty((
-            batch_dim, self.n_head, seq_dim, self.n_embd // self.n_head
+            self.config.oconfig.inference_batch_size, 
+            self.n_head, 
+            self.config.oconfig.inference_seq_len, 
+            self.n_embd // self.n_head
         ), dtype=torch.float32), persistent=False)
         self.register_buffer("v_cache", torch.empty((
-            batch_dim, self.n_head, seq_dim, self.n_embd // self.n_head
+            self.config.oconfig.inference_batch_size, 
+            self.n_head, 
+            self.config.oconfig.inference_seq_len, 
+            self.n_embd // self.n_head
         ), dtype=torch.float32), persistent=False)
 
     def forward(self, x, residual):
@@ -114,11 +117,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        self.k_cache[:B, :, pos, :] = k
-        self.v_cache[:B, :, pos, :] = v
+        self.k_cache[:, :, pos, :] = k
+        self.v_cache[:, :, pos, :] = v
         
-        k = self.kv_cache
-        v = self.kv_cache
+        k = self.k_cache
+        v = self.v_cache
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -210,8 +213,11 @@ class GPT(nn.Module):
         self.config = config
         self.quantizer = Quantizer(self.config.qconfig)
 
-        seq_dim = 512
-        self.causal_mask = torch.tril(torch.ones(seq_dim, seq_dim, dtype=torch.bool))
+        self.register_buffer("causal_mask", torch.tril(torch.ones(
+            self.config.oconfig.inference_seq_len, 
+            self.config.oconfig.inference_seq_len, 
+            dtype=torch.bool
+        )))
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -337,12 +343,13 @@ class GPT(nn.Module):
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
+        if 'qconfig' in override_args:
+            config_args['qconfig'] = override_args['qconfig']
+        if 'oconfig' in override_args:
+            config_args['oconfig'] = override_args['oconfig']
+
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
-
-        if 'quantize_from_init' in override_args:
-            print(f"overriding quantize_from_init to {override_args['quantize_from_init']}")
-            config.qconfig.quantize_from_init = override_args['quantize_from_init']
 
         model = GPT(config)
         sd = model.state_dict()
@@ -458,13 +465,21 @@ class GPT(nn.Module):
         result[:, :t] = idx
 
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
-        idx_next = prefill(self, idx, pos, temperature, top_k)
+        probs = prefill(self, idx, pos, temperature, top_k)
+        if top_k == 1:
+            idx_next = probs.argmax(-1, keepdim=True)
+        else:
+            idx_next = torch.multinomial(probs, num_samples=1)
         
         result[:, [t]] = idx_next
 
         for i in range(1, max_new_tokens):
             pos = torch.tensor([t + i], dtype=torch.long, device=device)
-            idx_next = decode_one_token(self, idx, pos, temperature, top_k)
+            probs = decode_one_token(self, idx_next, pos, temperature, top_k)
+            if top_k == 1:
+                idx_next = probs.argmax(-1, keepdim=True)
+            else:
+                idx_next = torch.multinomial(probs, num_samples=1)
 
             result[:, [t + i]] = idx_next
         

@@ -23,19 +23,16 @@ class QuantizedLinear(nn.Module):
             (out_features, in_features), 
             dtype=self.quantizer.quantized_dtype
         ))
-        self.register_buffer('bias', torch.empty(
-            (out_features,),
-            dtype=self.qconfig.dtype
-        ))
         self.register_buffer('scale', torch.ones(
             (out_features * in_features // self.qconfig.group_size, 1),
             dtype=self.qconfig.dtype
         ))
         self.register_buffer('zero_point', None)
+        self.register_buffer('bias', None)
 
     def quantize(self, weight, bias=None):
         self.weight, self.scale, self.zero_point = self.quantizer.quantize(weight)
-        if bias:
+        if bias is not None:
             self.bias = bias
 
     def forward(self, input):

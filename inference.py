@@ -6,7 +6,12 @@ from contextlib import nullcontext
 import numpy as np
 import time
 import torch
-from optimization.model import GPT
+from optimization import (
+    GPT,
+    OptimizationConfig,
+    QuantizeConfig,
+    WeightOnly8BitHandler,
+)
 import tiktoken
 
 # -----------------------------------------------------------------------------
@@ -17,9 +22,10 @@ bias = False
 real_data = True
 dataset = 'shakespeare'
 seed = 1337
+batch_size = 1
 num_samples = 3
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
 profile = False # use pytorch profiler, or just simple benchmarking?
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -35,9 +41,16 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # import pdb; pdb.set_trace()
 # model init
-model = GPT.from_pretrained(init_from)
+model = GPT.from_pretrained(init_from, override_args={
+    'oconfig': OptimizationConfig(inference_batch_size=batch_size)
+})
 model.eval()
 model.to(device)
+model.to(ptdtype)
+
+handler = WeightOnly8BitHandler(model)
+handler.handle()
+print("number of parameters: %.2fM" % (model.get_num_params()/1e6,))
 
 if compile:
     print("Compiling model...")
@@ -45,13 +58,14 @@ if compile:
 
 enc = tiktoken.get_encoding("gpt2")
 ctx = torch.tensor(enc.encode("hello everyone, my name is", allowed_special={"<|endoftext|>"}), dtype=torch.long, device=device).unsqueeze(0)
-ctx = ctx.repeat(12, 1)
+ctx = ctx.repeat(batch_size, 1)
 
 def benchmark(model, ctx):
     # warmup
     for i in range(1):
         model.generate_kv(ctx, 128, 0.4, 200)
-
+    print('-----------------------------------')
+    
     # torch.cuda.synchronize(device=None)
     # t = time.time()
     # for i in range(num_samples):
@@ -70,7 +84,6 @@ def benchmark(model, ctx):
     print(enc.decode(y[0].tolist()))
     print('-----------------------------------')
 
-    model.to(ptdtype)
 
     # torch.cuda.synchronize(device=None)
     # t = time.time()
@@ -81,14 +94,14 @@ def benchmark(model, ctx):
     # print(enc.decode(y[0].tolist()))
     # print('-----------------------------------')
 
-    torch.cuda.synchronize(device=None)
-    t = time.time()
-    for i in range(num_samples):
-        torch.manual_seed(i + seed)
-        y = model.generate_kv(ctx, 128, 0.4, 200)
-    fp16t_kv = time.time() - t
-    print(enc.decode(y[0].tolist()))
-    print('-----------------------------------')
+    # torch.cuda.synchronize(device=None)
+    # t = time.time()
+    # for i in range(num_samples):
+    #     torch.manual_seed(i + seed)
+    #     y = model.generate_kv(ctx, 128, 0.4, 200)
+    # fp16t_kv = time.time() - t
+    # print(enc.decode(y[0].tolist()))
+    # print('-----------------------------------')
 
     # quantize to uint8
     # model.quantize()
@@ -105,7 +118,7 @@ def benchmark(model, ctx):
     # print('fp32:', fp32t/num_samples)
     print('fp32_kv:', fp32t_kv/num_samples)
     # print('fp16:', fp16t/num_samples)
-    print('fp16_kv:', fp16t_kv/num_samples)
+    # print('fp16_kv:', fp16t_kv/num_samples)
     # print('uint8:', uint8t/num_samples)
     pass
 

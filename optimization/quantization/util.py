@@ -8,7 +8,7 @@ from dataclasses import dataclass
 class QuantizeConfig:
     quantize_from_init: bool = False
     sym: bool = True
-    dtype: torch.dtype = torch.float16
+    dtype: torch.dtype = torch.bfloat16
     num_bits: int = 8
     group_size: int = 32    # not used for now
     
