@@ -38,9 +38,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = QuantizedLinear(config.n_embd, 3 * config.n_embd, qconfig=config.qconfig, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
-        self.c_proj = QuantizedLinear(config.n_embd, config.n_embd, qconfig=config.qconfig, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -54,6 +54,20 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                    .view(1, 1, config.block_size, config.block_size))
+        
+        ### Initialize KV cache with up to a maximum sequence length. Also, keep track of how much of it is filled in self.seq_pos.
+        batch_dim = 32 # the maximum batch dimension we'll support. This is because T4 has smol mem.
+        seq_dim = 512 # the maximum sequence length we'll support
+        self.seq_pos = 0 # disabled by default
+        self.kv_enabled = False # disabled by default
+
+        self.register_buffer("kv_cache", torch.empty(( 
+            2, batch_dim, self.n_head, seq_dim, self.n_embd // self.n_head
+        ), dtype=torch.bfloat16), persistent=False)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -63,6 +77,17 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        ### Set KV cache if it exists:
+        if self.kv_enabled:
+            ### YOUR CODE HERE
+            # set the new seq_pos
+            self.seq_pos = T
+            # update the kv cache
+            self.kv_cache[0, :B, :, :self.seq_pos, :] = k
+            self.kv_cache[1, :B, :, :self.seq_pos, :] = v
+            ### END YOUR CODE HERE
+            pass
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -80,14 +105,57 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+    
+    def decode(self, x): # note: x now only includes the tokns *after* the KV cache
+        if not self.kv_enabled:
+            raise ValueError("KV cache is not enabled!")
+        
+        B, T, C = x.size()
+
+        # Use both the KV cache and the input to run MHA! Make sure to save new KV projections into the cache, too!
+        ### YOUR CODE HERE
+
+        # compute q, k, v projections of x
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # update the kv cache with the additional input
+        self.kv_cache[0, :B, :, self.seq_pos: self.seq_pos+T, :] = k.to(self.kv_cache.dtype)
+        self.kv_cache[1, :B, :, self.seq_pos: self.seq_pos+T, :] = v.to(self.kv_cache.dtype)
+        self.seq_pos += T
+        # compute manual implmentation of attention using the kv cache
+        k = self.kv_cache[0, :B, :, :self.seq_pos, :]
+        v = self.kv_cache[1, :B, :, :self.seq_pos, :]
+
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, 1, T) x (B, nh, T, hs) -> (B, nh, 1, hs)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # compute output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+        # update the position
+        
+        ### END YOUR CODE HERE
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = QuantizedLinear(config.n_embd, 4 * config.n_embd, qconfig=config.qconfig, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = QuantizedLinear(4 * config.n_embd, config.n_embd, qconfig=config.qconfig, bias=config.bias)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -108,6 +176,11 @@ class Block(nn.Module):
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+    
+    def decode(self, x):
+        x = x + self.attn.decode(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -154,6 +227,20 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+    # Some scaffolding from the 229s teaching staff.
+    @property # this is just a convenience function to make accessing easier
+    def seq_pos(self):
+        return self.transformer.h[0].attn.seq_pos
+    @seq_pos.setter
+    def seq_pos(self, value):
+        for block in self.transformer.h:
+            block.attn.seq_pos = value
+    def enable_kv(self, use_kv=True):
+        self.seq_pos = 0 if use_kv else None
+        self.kv_enabled = use_kv
+        for block in self.transformer.h:
+            block.attn.kv_enabled = use_kv
+
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -198,6 +285,31 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
+    
+    def decode(self, idx):
+        device = idx.device
+        b, t = idx.size()
+        assert self.seq_pos + t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+
+        # Run decoding on the GPT model itself. Make sure you set the right position embeddings!
+
+        ### YOUR CODE HERE
+
+        # create token and position embeddings
+        pos = torch.arange(self.seq_pos, self.seq_pos + t, dtype=torch.long, device=device)
+        pos_emb = self.transformer.wpe(pos).unsqueeze(0)
+        tok_emb = self.transformer.wte(idx)
+        # perform decoding
+        x = tok_emb + pos_emb
+        for l in self.transformer.h:
+            x = l.decode(x)
+        # apply transformer layer normalization
+        x = self.transformer.ln_f(x)
+        # apply the language model head
+        x = self.lm_head(x)
+        # return the output
+        return x
+        ### END YOUR CODE HERE
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -335,6 +447,153 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+    
+    @torch.no_grad()
+    def generate_kv(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+
+        # Generate the full KV cache and decode the first token
+
+        new_tokens = torch.empty((idx.size(0), 0))
+
+        ### YOUR CODE HERE
+
+        # run the idx through the forward pass to get the logits
+        logits, _ = self(idx)
+        # pluck the logits at the final position and scale by desired temperature
+        logits = logits[:, -1, :] / temperature
+        # optionally crop the logits to only the top k options
+        if top_k == 1:
+            idx_next = logits.argmax(-1, keepdim=True)
+            pass 
+        else:
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            pass 
+
+        # save the new tokens
+        new_tokens = idx_next
+        ### END YOUR CODE HERE
+
+        for _ in range(max_new_tokens-1):
+            # Now decode using the KV cache
+
+            ### YOUR CODE HERE
+
+            # decode from the new tokens to get the logits
+            logits = self.decode(idx_next)
+            # pluck the logits at the final position and scale by desired temperature
+            logits = logits.squeeze(1) / temperature
+            # optionally crop the logits to only the top k options
+            if top_k == 1:
+                idx_next = logits.argmax(-1, keepdim=True)
+                pass 
+            else:
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                pass 
+            # store the new tokens
+            new_tokens = torch.cat([new_tokens, idx_next], dim=1)
+            ### END YOUR CODE HERE
+
+        return torch.cat((idx, new_tokens), dim=1)
+
+    @torch.no_grad()
+    def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+
+        self.enable_kv(False) # disable KV cache for the main model -- it's not worth the effort
+
+        # note: making speculative decoding work with batch_size>1 is beyond this assignment's scope, because the
+        # tensors rapidly become ragged. So, you can assume that batch_size=1 for this part.
+        if idx.size(0) != 1:
+            raise ValueError("speculative decoding only works with batch size 1")
+        idx_length_original = idx.size(1)
+        
+        loop_counter = 0
+        while idx.size(1) < idx_length_original+max_new_tokens:
+            loop_counter += 1
+
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size-num_speculative else idx[:, -self.config.block_size-num_speculative:]
+
+            # Generate speculative tokens from the draft model. Then, run it through the main model.
+            # Be sure to set top_k=1, otherwise you'll pollute the RNG! (Which will make your code harder to debug.)
+
+            ### YOUR CODE HERE
+
+            # use the draft_model to generate speculative tokens
+            idx_speculative = draft_model.generate_kv(
+                idx_cond, num_speculative, temperature=temperature, top_k=1
+            ) # TODO (1, k+m)
+
+            # obtain the logits from the main model by passing in the idx_speculative
+            all_logits, _ = self(idx_speculative) # TODO
+            
+            ### END YOUR CODE HERE
+
+            # Step through the predictions of the main model, sampling, and check whether they match the next token. Stop upon mismatch.
+
+            ### YOUR CODE HERE
+
+            # iterate from the end position of idx_cond (prefix sequence) to the end position of idx_speculative (generated sequence)
+            for i in range(idx_cond.shape[1], idx_speculative.shape[1]):
+                # pluck the logits at the current position and scale by desired temperature
+                curr_logits = all_logits[:, i-1, :] / temperature
+                # optionally crop the logits to only the top k options
+                if top_k == 1:
+                    idx_next = curr_logits.argmax(-1, keepdim=True)
+                    pass 
+                else:
+                    if top_k is not None:
+                        v, _ = torch.topk(curr_logits, min(top_k, curr_logits.size(-1)))
+                        curr_logits[curr_logits < v[:, [-1]]] = -float('Inf')
+                    probs = F.softmax(curr_logits, dim=-1)
+                    idx_next = torch.multinomial(probs, num_samples=1)
+                    pass 
+                # # apply softmax to convert logits to (normalized) probabilities
+                # probs = F.softmax(curr_logits, dim=-1) # TODO
+
+                # # sample from the distribution with temperature
+                # idx_next = torch.multinomial(... # TODO
+
+                # append sampled index to the running sequence and continue
+                idx = torch.cat([idx, idx_next], dim=1)
+                # end the loop if the next token does not match the next token in idx_speculative
+                if idx_next[0, 0] != idx_speculative[0, i]:
+                    break
+            else:
+                if idx.size(1) < idx_length_original+max_new_tokens:
+                    curr_logits = all_logits[:, -1, :] / temperature
+                    if top_k == 1:
+                        idx_next = curr_logits.argmax(-1, keepdim=True)
+                        pass 
+                    else:
+                        if top_k is not None:
+                            v, _ = torch.topk(curr_logits, min(top_k, curr_logits.size(-1)))
+                            curr_logits[curr_logits < v[:, [-1]]] = -float('Inf')
+                        probs = F.softmax(curr_logits, dim=-1)
+                        idx_next = torch.multinomial(probs, num_samples=1)
+                        pass 
+                    idx = torch.cat([idx, idx_next], dim=1)
+            ### END YOUR CODE HERE
+                
+        print(f"speculative decoding ran for {loop_counter} iterations")
+        return idx[:,:idx_length_original+max_new_tokens]
 
 
     def prune_weight(self, sparsity=0.1, method="individual"):
@@ -407,8 +666,3 @@ class GPT(nn.Module):
                 W = layers[name].weight.data
                 W_mask = (W == 0)
                 layers[name].weight.grad[W_mask] = 0
-
-    def quantize(self):
-        for m in self.modules():
-            if isinstance(m, QuantizedLinear):
-                m.quantize()
