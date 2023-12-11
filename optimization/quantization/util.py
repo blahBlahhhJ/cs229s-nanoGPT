@@ -25,7 +25,7 @@ class Quantizer:
         else:
             return torch.uint8
 
-    @torch.no_grad
+    @torch.no_grad()
     def quantize(self, tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Arguments:
@@ -73,7 +73,7 @@ class Quantizer:
 
         return tensor, scale, zero_point
 
-    @torch.no_grad
+    @torch.no_grad()
     def dequantize(self, tensor: Tensor, quant_scale: Tensor, quant_min: Tensor) -> Tensor:
         """
         Arguments:

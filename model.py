@@ -55,19 +55,16 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
         
-        # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                    .view(1, 1, config.block_size, config.block_size))
-        
         ### Initialize KV cache with up to a maximum sequence length. Also, keep track of how much of it is filled in self.seq_pos.
         batch_dim = 32 # the maximum batch dimension we'll support. This is because T4 has smol mem.
         seq_dim = 512 # the maximum sequence length we'll support
         self.seq_pos = 0 # disabled by default
         self.kv_enabled = False # disabled by default
 
-        self.register_buffer("kv_cache", torch.empty(( 
-            2, batch_dim, self.n_head, seq_dim, self.n_embd // self.n_head
-        ), dtype=torch.bfloat16), persistent=False)
+        if self.kv_enabled:
+            self.register_buffer("kv_cache", torch.empty(( 
+                2, batch_dim, self.n_head, seq_dim, self.n_embd // self.n_head
+            ), dtype=torch.float32), persistent=False)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -240,6 +237,12 @@ class GPT(nn.Module):
         self.kv_enabled = use_kv
         for block in self.transformer.h:
             block.attn.kv_enabled = use_kv
+            if use_kv:
+                batch_dim = 32 # the maximum batch dimension we'll support. This is because T4 has smol mem.
+                seq_dim = 512 # the maximum sequence length we'll support
+                block.register_buffer("kv_cache", torch.empty(( 
+                    2, batch_dim, block.n_head, seq_dim, block.n_embd // block.n_head
+                ), dtype=torch.float32), persistent=False)
 
     def get_num_params(self, non_embedding=True):
         """

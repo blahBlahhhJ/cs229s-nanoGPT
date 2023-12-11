@@ -39,4 +39,4 @@ def decode_one_token(model, idx, pos, temperature=1.0, top_k=None):
         return probs
 
 # prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
-decode_one_token = torch.compile(decode_one_token, mode='reduce-overhead', fullgraph=True)
+# decode_one_token = torch.compile(decode_one_token, mode='reduce-overhead', fullgraph=True)
