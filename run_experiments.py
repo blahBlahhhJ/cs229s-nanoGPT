@@ -153,6 +153,7 @@ val_steps = (len(val_data)-1) // (batch_size * block_size) - 1
 batch_loss = []
 model.eval()
 with torch.no_grad():
+    start = 0
     for k in tqdm(range(val_steps)):
         X, Y = get_batch('val')
         with ctx:
