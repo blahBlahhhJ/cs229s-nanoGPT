@@ -57,7 +57,7 @@ class CausalSelfAttention(nn.Module):
         
         ### Initialize KV cache with up to a maximum sequence length. Also, keep track of how much of it is filled in self.seq_pos.
         batch_dim = 32 # the maximum batch dimension we'll support. This is because T4 has smol mem.
-        seq_dim = 512 # the maximum sequence length we'll support
+        seq_dim = 1074 # the maximum sequence length we'll support
         self.seq_pos = 0 # disabled by default
         self.kv_enabled = False # disabled by default
 
@@ -239,10 +239,10 @@ class GPT(nn.Module):
             block.attn.kv_enabled = use_kv
             if use_kv:
                 batch_dim = 32 # the maximum batch dimension we'll support. This is because T4 has smol mem.
-                seq_dim = 512 # the maximum sequence length we'll support
-                block.register_buffer("kv_cache", torch.empty(( 
-                    2, batch_dim, block.n_head, seq_dim, block.n_embd // block.n_head
-                ), dtype=torch.float32), persistent=False)
+                seq_dim = 1074 # the maximum sequence length we'll support
+                block.attn.register_buffer("kv_cache", torch.empty(( 
+                    2, batch_dim, block.attn.n_head, seq_dim, block.attn.n_embd // block.attn.n_head
+                ), dtype=torch.float32, device='cuda'), persistent=False)
 
     def get_num_params(self, non_embedding=True):
         """
@@ -284,7 +284,7 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
@@ -532,7 +532,7 @@ class GPT(nn.Module):
             loop_counter += 1
 
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size-num_speculative else idx[:, -self.config.block_size-num_speculative:]
+            idx_cond = idx if idx.size(1) <= self.config.block_size-num_speculative else idx[:, -(self.config.block_size-num_speculative):]
 
             # Generate speculative tokens from the draft model. Then, run it through the main model.
             # Be sure to set top_k=1, otherwise you'll pollute the RNG! (Which will make your code harder to debug.)
