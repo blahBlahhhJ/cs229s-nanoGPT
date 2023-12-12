@@ -654,10 +654,12 @@ class GPT(nn.Module):
                     norms = torch.norm(W.view(W.size(0), -1), dim=0)
                     # calculate the threshold value
                     threshold = torch.topk(norms, int(sparsity * W.size(1)), largest=True)[0].min()
-                    W_mask = (norms <= threshold)
-                    W[:, W_mask] = 0
+                    W_mask = (norms < threshold)
                     # print(f"pruning block{i}.{name} with threshold {threshold:.3e}, {W_mask.sum().item()}/{W.numel()} parameters pruned")
+                    # returns index of nonzero elements
                     layers[name].prune_mask = W_mask
+                    W[:, W_mask] = 0
+                    layers[name].active_indices = (~W_mask).nonzero().squeeze(1)
                 else:
                     raise NotImplementedError(f"pruning method {method} not implemented")
 
