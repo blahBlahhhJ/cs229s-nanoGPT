@@ -25,6 +25,9 @@ profile = False # use pytorch profiler, or just simple benchmarking?
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
+curr_time = time.strftime("%m%d-%H%M%S")
+log_file = open(f'part1_with_quant_{batch_size}_{curr_time}.log', 'a')
+
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
@@ -70,16 +73,14 @@ else:
 
 model = GPT.from_pretrained("gpt2-medium")
 
-print("model with quantization")
+print("model with quantization", file=log_file, flush=True)
 model.eval()
 model.to(ptdtype)
 handler = WeightOnly8BitHandler(model)
 handler.handle()
 model.to(device)
-print("max GPU memory allocated:", torch.cuda.max_memory_allocated())
+print("max GPU memory allocated before inference:", torch.cuda.max_memory_allocated(), file=log_file, flush=True)
 for i, data in enumerate([train_data, val_data]):
-    if i == 0:
-        continue
     # reset indicator
     start = 0
     # len(data)-1 because the label needs to be shifted by 1
@@ -95,8 +96,8 @@ for i, data in enumerate([train_data, val_data]):
             # print(f"{k}/{steps} {train_or_val} loss: {lossf:.4f}")
             batch_loss.append(lossf)
     loss = np.mean(batch_loss)
-    print("max GPU memory allocated after inference:", torch.cuda.max_memory_allocated())
-    print(f"{train_or_val} loss: {loss:.4f}")
-    print(f"{train_or_val} perplexity: {np.exp(loss):.4f}")
+    print("max GPU memory allocated after inference:", torch.cuda.max_memory_allocated(), file=log_file, flush=True)
+    print(f"{train_or_val} loss: {loss:.4f}", file=log_file, flush=True)
+    print(f"{train_or_val} perplexity: {np.exp(loss):.4f}", file=log_file, flush=True)
 
-
+log_file.close()

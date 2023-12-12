@@ -17,6 +17,7 @@ batch_size = 1
 block_size = 1024
 num_samples = 5
 generate_num = 50
+topk = 1
 seed = 1337
 gradient_accumulation_steps = 40
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
@@ -25,6 +26,9 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 profile = False # use pytorch profiler, or just simple benchmarking?
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
+
+curr_time = time.strftime("%m%d-%H%M%S")
+log_file = open(f'part1_decoding_{curr_time}.log', 'a')
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
@@ -35,7 +39,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 model = GPT.from_pretrained("gpt2-medium")
-model.to(torch.bfloat16)
+# model.to(torch.bfloat16)
 model.to(device)
 
 draft_model = GPT.from_pretrained("gpt2")
@@ -43,7 +47,7 @@ draft_model.enable_kv()
 draft_model.to(torch.bfloat16)
 draft_model.to(device)
 
-print("standard vs speculative decoding with main model gpt2-medium and draft model gpt2-small")
+print("standard vs speculative decoding with main model gpt2-medium and draft model gpt2-small", file=log_file, flush=True)
 
 enc = tiktoken.get_encoding("gpt2")
 dataset = 'wikitext'
@@ -52,54 +56,55 @@ val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r
 i = 229
 x = torch.from_numpy((val_data[i:i+block_size]).astype(np.int64))
 ctx = torch.tensor(x, dtype=torch.long, device=device).unsqueeze(0)
+# ctx = torch.tensor(enc.encode("Hello my name is ", allowed_special={"<|endoftext|>"}), dtype=torch.long, device=device).unsqueeze(0)
 ctx = ctx.repeat(batch_size, 1)
 
 print("------------------- warm up ---------------------")
 for i in range(1):
-    model.generate(ctx, generate_num, 0.4, 200)
+    model.generate(ctx, generate_num, 0.4, topk)
 print('-------------------------------------------------')
 
 torch.cuda.synchronize(device=None)
 t = time.time()
 for i in range(num_samples):
     torch.manual_seed(i + seed)
-    y = model.generate(ctx, generate_num, 0.4, 200)
+    y = model.generate(ctx, generate_num, 0.4, topk)
 fp32t_kv = time.time() - t
 # print(enc.decode(y[0].tolist()))
 print('-------------------------------------------------')
-print('standard decoding latency (seconds):', fp32t_kv/num_samples)
+print('standard decoding latency (seconds):', fp32t_kv/num_samples, file=log_file, flush=True)
 
 print("------------------- warm up ---------------------")
 for i in range(1):
-    model.generate_speculative(ctx, generate_num, draft_model, 0.4, 200)
+    model.generate_speculative(ctx, generate_num, draft_model, 0.4, topk)
 print('-------------------------------------------------')
 
 torch.cuda.synchronize(device=None)
 t = time.time()
 for i in range(num_samples):
     torch.manual_seed(i + seed)
-    y = model.generate_speculative(ctx, generate_num, draft_model, 0.4, 200)
+    y = model.generate_speculative(ctx, generate_num, draft_model, 0.4, topk)
 fp32t_kv = time.time() - t
 # print(enc.decode(y[0].tolist()))
 print('-------------------------------------------------')
-print('speculative decoding latency (seconds):', fp32t_kv/num_samples)
+print('speculative decoding latency (seconds):', fp32t_kv/num_samples, file=log_file, flush=True)
 
-print("standard vs speculative decoding with main model gpt2-medium and draft model gpt2-medium quantized")
+print("standard vs speculative decoding with main model gpt2-medium and draft model gpt2-medium quantized", file=log_file, flush=True)
 
 print("------------------- warm up ---------------------")
 for i in range(1):
-    model.generate(ctx, generate_num, 0.4, 200)
+    model.generate(ctx, generate_num, 0.4, topk)
 print('-------------------------------------------------')
 
 torch.cuda.synchronize(device=None)
 t = time.time()
 for i in range(num_samples):
     torch.manual_seed(i + seed)
-    y = model.generate(ctx, generate_num, 0.4, 200)
+    y = model.generate(ctx, generate_num, 0.4, topk)
 fp32t_kv = time.time() - t
-# print(enc.decode(y[0].tolist()))
+print(enc.decode(y[0].tolist()))
 print('-------------------------------------------------')
-print('standard decoding latency (seconds):', fp32t_kv/num_samples)
+print('standard decoding latency (seconds):', fp32t_kv/num_samples, file=log_file, flush=True)
 
 draft_model = GPT.from_pretrained("gpt2-medium")
 draft_model.enable_kv()
@@ -110,15 +115,15 @@ draft_model.to(device)
 
 print("------------------- warm up ---------------------")
 for i in range(1):
-    model.generate_speculative(ctx, generate_num, draft_model, 0.4, 200)
+    model.generate_speculative(ctx, generate_num, draft_model, 0.4, topk)
 print('-------------------------------------------------')
 
 torch.cuda.synchronize(device=None)
 t = time.time()
 for i in range(num_samples):
     torch.manual_seed(i + seed)
-    y = model.generate_speculative(ctx, generate_num, draft_model, 0.4, 200)
+    y = model.generate_speculative(ctx, generate_num, draft_model, 0.4, topk)
 fp32t_kv = time.time() - t
 # print(enc.decode(y[0].tolist()))
 print('-------------------------------------------------')
-print('speculative decoding latency (seconds):', fp32t_kv/num_samples)
+print('speculative decoding latency (seconds):', fp32t_kv/num_samples, file=log_file, flush=True)

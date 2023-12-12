@@ -4,17 +4,19 @@ import numpy as np
 import time
 import torch
 import json
+import argparse
 from model import GPT
-from optimization import WeightOnly8BitHandler
+from utils import L2PruningHandler
 import tiktoken
 from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
-result = dict()
+prune_method = 'l2norm' # 'l2norm' or 'individual'
 
 # -----------------------------------------------------------------------------
-batch_size = 4
+batch_size = 8
 block_size = 1024
+iterations = 100
 real_data = True
 seed = 1337
 gradient_accumulation_steps = 40
@@ -26,7 +28,7 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 # -----------------------------------------------------------------------------
 
 curr_time = time.strftime("%m%d-%H%M%S")
-log_file = open(f'part1_no_quant_{batch_size}_{curr_time}.log', 'a')
+log_file = open(f'part2a_{prune_method}_{curr_time}.log', 'a')
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
@@ -53,8 +55,7 @@ if real_data:
             raise ValueError(f"Invalid split: {split}")
         
         if split == "train":
-            ix = torch.arange(start, start + batch_size * block_size, block_size)
-            start += batch_size * block_size
+            ix = torch.randint(len(data) - block_size, (batch_size,))
         elif split == "val":
             ix = torch.arange(start, start + batch_size * block_size, block_size)
             start += batch_size * block_size
@@ -72,31 +73,51 @@ else:
     get_batch = lambda split: (x, y)
 
 model = GPT.from_pretrained("gpt2-medium")
-print("model without quantization", file=log_file, flush=True)
-# use torch.float32 instead
-# model.to(torch.bfloat16)
-model.to(device)
 
-model.eval()
-print("max GPU memory allocated before inference:", torch.cuda.max_memory_allocated(), file=log_file, flush=True)
-for i, data in enumerate([train_data, val_data]):
-    # reset indicator
-    start = 0
-    # len(data)-1 because the label needs to be shifted by 1
-    train_or_val = "train" if i == 0 else "val"
-    steps = (len(data)-1) // (batch_size * block_size) - 1
-    batch_loss = []
-    with torch.no_grad():
-        for k in tqdm(range(steps)):
-            X, Y = get_batch(train_or_val)
+if prune_method == 'l2norm':
+    handler = L2PruningHandler(model)
+    handler.handle()
+
+model.to(device)
+optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
+
+val_steps = (len(val_data)-1) // (batch_size * block_size) - 1
+for sparsity in np.arange(1.0, 0.0, -0.1):
+    train_loss = []
+    model.train()
+    model.prune_weight(sparsity=sparsity, method=prune_method)
+    prev_time = time.time()
+    for num_steps in tqdm(range(iterations)):
+        optimizer.zero_grad(set_to_none=True)
+        for _ in range(gradient_accumulation_steps):
+            X, Y = get_batch('train')
             with ctx:
-                _, loss = model(X, Y)
-            lossf = loss.item()
-            # print(f"{k}/{steps} {train_or_val} loss: {lossf:.4f}")
-            batch_loss.append(lossf)
-    loss = np.mean(batch_loss)
-    print("max GPU memory allocated after inference:", torch.cuda.max_memory_allocated(), file=log_file, flush=True)
-    print(f"{train_or_val} loss: {loss:.4f}", file=log_file, flush=True)
-    print(f"{train_or_val} perplexity: {np.exp(loss):.4f}", file=log_file, flush=True)
+                logits, loss = model(X, Y)
+            loss.backward()
+            train_loss.append(loss.item())
+        model.prune_grad(method=prune_method)
+        optimizer.step()
+    curr_time = time.time()
+    print(f"sparsity: {sparsity:.2f}, training time per iteration: {(curr_time - prev_time) / iterations:.4f}", file=log_file, flush=True)
+    lossf = np.mean(train_loss)
+    print(f"sparsity: {sparsity:.2f}, training loss: {lossf:.4f}", file=log_file, flush=True)
+    # validation
+    model.eval()
+    val_loss = []
+    time_lst = []
+    with torch.no_grad():
+        start = 0
+        for k in tqdm(range(val_steps)):
+            X, Y = get_batch('val')
+            prev_time = time.time()
+            with ctx:
+                logits, loss = model(X, Y)
+            curr_time = time.time()
+            time_lst.append(curr_time - prev_time)
+            val_loss.append(loss.item())
+    val_lossf = np.mean(val_loss)
+    num_token_per_sec = batch_size * block_size / np.mean(time_lst)
+    print(f"sparsity: {sparsity:.2f}, validation number of tokens per second: {num_token_per_sec:.4f}", file=log_file, flush=True)
+    print(f"sparsity: {sparsity:.2f}, validation loss: {val_lossf:.4f}", file=log_file, flush=True)
 
 log_file.close()
