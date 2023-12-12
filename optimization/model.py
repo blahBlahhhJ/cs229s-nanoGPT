@@ -19,6 +19,7 @@ from optimization.util import (
     OptimizationConfig,
     prefill,
     decode_one_token,
+    decode_n_tokens,
 )
 
 
@@ -474,7 +475,7 @@ class GPT(nn.Module):
         result[:, [t]] = idx_next
 
         for i in range(1, max_new_tokens):
-            pos = torch.tensor([t + i], dtype=torch.long, device=device)
+            pos = torch.tensor([t + i - 1], dtype=torch.long, device=device)
             probs = decode_one_token(self, idx_next, pos, temperature, top_k)
             if top_k == 1:
                 idx_next = probs.argmax(-1, keepdim=True)
@@ -482,5 +483,78 @@ class GPT(nn.Module):
                 idx_next = torch.multinomial(probs, num_samples=1)
 
             result[:, [t + i]] = idx_next
+        
+        return result
+
+    def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4):
+        device = idx.device
+        b, t = idx.size()
+        assert b == 1, 'Speculative decoding only works for batch size = 1.'
+        result = torch.empty((b, t + max_new_tokens), dtype=torch.long, device=device)
+        result[:, :t] = idx
+
+        pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
+        probs = prefill(self, idx, pos, temperature, top_k)
+        # prefill draft model as well
+        _ = prefill(draft_model, idx, pos, temperature, top_k)
+
+        if top_k == 1:
+            idx_next = probs.argmax(-1, keepdim=True)
+        else:
+            idx_next = torch.multinomial(probs, num_samples=1)
+        
+        result[:, [t]] = idx_next
+
+        i = 1
+        while i < max_new_tokens:
+            draft_tokens, draft_probs = decode_n_tokens(self, idx_next, t+i-1, num_speculative, device, temperature=1.0, top_k=None)
+            
+            pos = torch.arange(t+i - 1, t+i + num_speculative, device=device) # num_speculative + 1 positions
+            logits = self.decode(torch.cat([idx_next, draft_tokens], dim=1), pos)   # if this errors, check idx_next.shape
+            logits = logits / temperature   # (B, 1+4, V)
+
+            if top_k == 1:
+                for j in range(num_speculative):
+                    target_token = logits[:, j, :].argmax()
+                    if target_token != draft_tokens[j]:
+                        # then j = accept_length
+                        idx_next = torch.multinomial(logits[:, j, :], num_samples=1)
+                        result[:, pos[:j+1] + 1] = torch.cat([draft_tokens[:j], idx_next])
+                        i += j + 1
+                        break
+                else:
+                    idx_next = torch.multinomial(target_probs[:, -1, :], num_samples=1)
+                    result[:, pos + 1] = torch.cat([draft_tokens, idx_next])
+                    # fill last token into draft model
+                    decode_one_token(draft_model, draft_tokens[-1], pos[-1], temperature, top_k)
+                    i += 1
+            else:
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('inf')
+                target_probs = F.softmax(logits, dim=-1)
+
+                p = draft_probs[torch.arange(0, num_speculative, device=device), draft_tokens]
+                q = target_probs[torch.arange(0, num_speculative, device=device), draft_tokens]
+
+                accept_draft_prob = torch.minimum(torch.ones(()), q / p)
+                rejected_locations = (torch.rand_like(accept_draft_prob) > accept_draft_prob).nonzero()
+
+                if rejected_locations.shape[0] == 0: # All draft tokens have been accepted
+                    accept_length = num_speculative + 1
+                    idx_next = torch.multinomial(target_probs[:, -1, :], num_samples=1)
+                    result[:, pos + 1] = torch.cat([draft_tokens, idx_next])
+                    # fill last token into draft model
+                    decode_one_token(draft_model, draft_tokens[-1], pos[-1], temperature, top_k)
+                else:
+                    accept_length = rejected_locations[0].item()
+                    p = draft_probs[accept_length]
+                    q = target_probs[accept_length]
+                    new = q - p
+                    new = torch.where(new > 0, new, 0.0)
+                    new = new / new.sum()
+                    idx_next = torch.multinomial(new, num_samples=1)
+                    result[:, pos[:accept_length+1] + 1] = torch.cat([draft_tokens[:accept_length], idx_next])
+                i += accept_length + 1
         
         return result
