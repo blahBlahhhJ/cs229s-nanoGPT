@@ -5,6 +5,7 @@ import time
 import torch
 import json
 from model import GPT
+from utils import L2PruningHandler
 import tiktoken
 from tqdm import tqdm
 
@@ -71,6 +72,11 @@ else:
     get_batch = lambda split: (x, y)
 
 model = GPT.from_pretrained("gpt2-medium")
+
+if prune_method == 'l2norm':
+    handler = L2PruningHandler(model)
+    handler.handle()
+
 model.to(device)
 optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
 
