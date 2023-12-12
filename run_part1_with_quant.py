@@ -15,7 +15,6 @@ result = dict()
 # -----------------------------------------------------------------------------
 batch_size = 4
 block_size = 1024
-bias = False
 real_data = True
 seed = 1337
 gradient_accumulation_steps = 40

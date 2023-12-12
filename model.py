@@ -645,19 +645,24 @@ class GPT(nn.Module):
                     threshold = torch.topk(W_abs.view(-1), int(sparsity * W.numel()), largest=True)[0].min()
                     W_mask = (W_abs <= threshold)
                     W[W_mask] = 0
-                    print(f"pruning block{i}.{name} with threshold {threshold:.3e}, {W_mask.sum().item()}/{W.numel()} parameters pruned")
+                    # print(f"pruning block{i}.{name} with threshold {threshold:.3e}, {W_mask.sum().item()}/{W.numel()} parameters pruned")
+                    layers[name].prune_mask = W_mask
+                    # TODO: add require_grad = False?
                 elif method == "l2norm":
+                    # weights are stored in transpose
                     # it should be two dimensions, but just in case
-                    norms = torch.norm(W.view(W.size(0), -1), dim=1)
+                    norms = torch.norm(W.view(W.size(0), -1), dim=0)
                     # calculate the threshold value
-                    threshold = torch.topk(norms, int(sparsity * W.size(0)), largest=True)[0].min()
+                    threshold = torch.topk(norms, int(sparsity * W.size(1)), largest=True)[0].min()
                     W_mask = (norms <= threshold)
-                    W[W_mask] = 0
+                    W[:, W_mask] = 0
+                    # print(f"pruning block{i}.{name} with threshold {threshold:.3e}, {W_mask.sum().item()}/{W.numel()} parameters pruned")
+                    layers[name].prune_mask = W_mask
                 else:
                     raise NotImplementedError(f"pruning method {method} not implemented")
 
     @torch.no_grad()
-    def prune_grad(self):
+    def prune_grad(self, method="individual"):
         """
         Structured pruning. Set corresponding gradient to zero for model weights that are below a certain threshold.
         """
@@ -667,5 +672,9 @@ class GPT(nn.Module):
             layers = find_layers(blocks[i])
             for name in layers:
                 W = layers[name].weight.data
-                W_mask = (W == 0)
-                layers[name].weight.grad[W_mask] = 0
+                if hasattr(layers[name], 'prune_mask'):
+                    W_mask = layers[name].prune_mask
+                    if method == 'individual':
+                        layers[name].weight.grad[W_mask] = 0
+                    elif method == 'l2norm':
+                        layers[name].weight.grad[:, W_mask] = 0

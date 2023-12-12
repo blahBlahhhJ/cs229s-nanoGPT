@@ -5,16 +5,19 @@ import time
 import torch
 import json
 from model import GPT
-from optimization import WeightOnly8BitHandler
 import tiktoken
 from tqdm import tqdm
+
+log_file = open('part2_individual.log', 'a')
 
 # -----------------------------------------------------------------------------
 result = dict()
 
 # -----------------------------------------------------------------------------
-batch_size = 4
+batch_size = 8
 block_size = 1024
+iterations = 100
+prune_method = "individual"
 real_data = True
 seed = 1337
 gradient_accumulation_steps = 40
@@ -50,8 +53,7 @@ if real_data:
             raise ValueError(f"Invalid split: {split}")
         
         if split == "train":
-            ix = torch.arange(start, start + batch_size * block_size, block_size)
-            start += batch_size * block_size
+            ix = torch.randint(len(data) - block_size, (batch_size,))
         elif split == "val":
             ix = torch.arange(start, start + batch_size * block_size, block_size)
             start += batch_size * block_size
@@ -69,31 +71,37 @@ else:
     get_batch = lambda split: (x, y)
 
 model = GPT.from_pretrained("gpt2-medium")
-print("model without quantization")
-model.to(torch.bfloat16)
 model.to(device)
+optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
 
-model.eval()
-print("max GPU memory allocated:", torch.cuda.max_memory_allocated())
-for i, data in enumerate([train_data, val_data]):
-    if i == 0:
-        continue
-    # reset indicator
-    start = 0
-    # len(data)-1 because the label needs to be shifted by 1
-    train_or_val = "train" if i == 0 else "val"
-    steps = (len(data)-1) // (batch_size * block_size) - 1
-    batch_loss = []
-    with torch.no_grad():
-        for k in tqdm(range(steps)):
-            X, Y = get_batch(train_or_val)
+val_steps = (len(val_data)-1) // (batch_size * block_size) - 1
+for sparsity in np.arange(1.0, 0.0, -0.1):
+    train_loss = []
+    model.train()
+    model.prune_weight(sparsity=sparsity, method=prune_method)
+    for num_steps in tqdm(range(iterations)):
+        optimizer.zero_grad(set_to_none=True)
+        for _ in range(gradient_accumulation_steps):
+            X, Y = get_batch('train')
             with ctx:
-                _, loss = model(X, Y)
-            lossf = loss.item()
-            # print(f"{k}/{steps} {train_or_val} loss: {lossf:.4f}")
-            batch_loss.append(lossf)
-    loss = np.mean(batch_loss)
-    print("max GPU memory allocated after inference:", torch.cuda.max_memory_allocated())
-    print(f"{train_or_val} loss: {loss:.4f}")
-    print(f"{train_or_val} perplexity: {np.exp(loss):.4f}")
+                logits, loss = model(X, Y)
+            loss.backward()
+            train_loss.append(loss.item())
+        model.prune_grad(method=prune_method)
+        optimizer.step()
+    lossf = np.mean(train_loss)
+    print(f"sparsity: {sparsity:.2f}, training loss: {lossf:.4f}", file=log_file)
+    # validation
+    model.eval()
+    val_loss = []
+    with torch.no_grad():
+        start = 0
+        for k in tqdm(range(val_steps)):
+            X, Y = get_batch('val')
+            with ctx:
+                logits, loss = model(X, Y)
+            val_loss.append(loss.item())
+    val_lossf = np.mean(val_loss)
+    print(f"sparsity: {sparsity:.2f}, validation loss: {val_lossf:.4f}", file=log_file)
 
+    
