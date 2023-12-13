@@ -10,7 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
-from utils import find_layers
+from utils import find_layers, PrunedLinear
 
 import torch
 import torch.nn as nn
@@ -666,7 +666,7 @@ class GPT(nn.Module):
     @torch.no_grad()
     def prune_grad(self, method="individual"):
         """
-        Structured pruning. Set corresponding gradient to zero for model weights that are below a certain threshold.
+        Set corresponding gradient to zero for model weights that are below a certain threshold.
         """
         blocks = self.transformer.h + [self.lm_head]
         # for each block, prune mlp layers
@@ -680,3 +680,15 @@ class GPT(nn.Module):
                         layers[name].weight.grad[W_mask] = 0
                     elif method == 'l2norm':
                         layers[name].weight.grad[:, W_mask] = 0
+                        
+    def mask_weight(self):
+        """
+        Precompute weight (delete rows of zeros) for structured pruning (l2norm).
+        """
+        blocks = self.transformer.h + [self.lm_head]
+        # for each block, prune mlp layers
+        for i in range(len(blocks)):
+            layers = find_layers(blocks[i], layers=[PrunedLinear])
+            for name in layers:
+                W = layers[name].weight.data
+                layers[name].pruned_weight = W[:, layers[name].active_indices]

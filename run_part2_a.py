@@ -78,10 +78,10 @@ if prune_method == 'l2norm':
     handler = L2PruningHandler(model)
     handler.handle()
 
+val_steps = (len(val_data)-1) // (batch_size * block_size) - 1
 model.to(device)
 optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
 
-val_steps = (len(val_data)-1) // (batch_size * block_size) - 1
 for sparsity in np.arange(1.0, 0.0, -0.1):
     train_loss = []
     model.train()
@@ -107,6 +107,9 @@ for sparsity in np.arange(1.0, 0.0, -0.1):
     time_lst = []
     with torch.no_grad():
         start = 0
+        # precompute weight for l2norm
+        model.mask_weight()
+        torch.cuda.synchronize()
         for k in tqdm(range(val_steps)):
             X, Y = get_batch('val')
             prev_time = time.time()

@@ -11,13 +11,13 @@ import tiktoken
 from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
-prune_method = 'l2norm' # 'l2norm' or 'individual'
+prune_method = 'individual' # 'l2norm' or 'individual'
 
 # -----------------------------------------------------------------------------
 batch_size = 8
 block_size = 1024
 target_sparsity = 0.1
-sparsity_increment = 0.05
+sparsity_increment = 0.01
 target_loss = 3.2
 real_data = True
 seed = 1337
@@ -119,6 +119,7 @@ def get_loss(model, split='val'):
     model.train()
     return val_lossf
 
+torch.cuda.synchronize()
 # step 1: train 50 iterations
 print("step 1: train 50 iterations", file=log_file, flush=True)
 lossf = train_model(model, 50)
@@ -127,16 +128,18 @@ print(f"step 1 training loss: {lossf:.4f}", file=log_file, flush=True)
 val_lossf = get_loss(model)
 print(f"step 1 validation loss: {val_lossf:.4f}", file=log_file, flush=True)
 
+torch.cuda.synchronize()
 # step 2: iteratively prune and retrain according to validation loss
 print("step 2: iterative pruning and retraining", file=log_file, flush=True)
 for sparsity in np.arange(1.0-sparsity_increment, 0.0, -sparsity_increment):
-    if sparsity <= target_sparsity:
+    # floating point issue when subtracting sparsity_increment
+    if round(sparsity,2) < target_sparsity:
         print(f"current sparsity {sparsity:.2f} is less than target sparsity {target_sparsity:.2f}, stop pruning", file=log_file, flush=True)
         break
     model.prune_weight(sparsity=sparsity, method=prune_method)
     lossf = get_loss(model, split='train')
     print(f"current sparsity {sparsity:.2f} train loss: {lossf:.4f}", file=log_file, flush=True)
-    while lossf >= target_loss:
+    if lossf >= target_loss:
         print("finetune model", file=log_file, flush=True)
         lossf = train_model(model, 25)
         print(f"current sparsity {sparsity:.2f} training loss after finetuning: {lossf:.4f}", file=log_file, flush=True)
