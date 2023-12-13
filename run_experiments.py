@@ -7,7 +7,7 @@ import numpy as np
 import time
 import torch
 import json
-from optimization.model import GPTConfig, GPT
+from optimization.model import OptimizationConfig, GPT
 import tiktoken
 from tqdm import tqdm
 
@@ -21,6 +21,7 @@ bias = False
 real_data = True
 seed = 1337
 gradient_accumulation_steps = 40
+model_type = 'gpt2' # examples: 'gpt2', 'gpt2-medium'
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
@@ -84,7 +85,7 @@ else:
 #     bias = bias,
 # )
 # model = GPT(gptconf)
-model = GPT.from_pretrained("gpt2-medium")
+model = GPT.from_pretrained(model_type)
 model.to(device)
 optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
 
@@ -170,13 +171,18 @@ print("Second task: inference latency")
 enc = tiktoken.get_encoding("gpt2")
 
 for batch in [1, 12]:
+    model = GPT.from_pretrained(model_type, override_args={
+        'oconfig': OptimizationConfig(inference_batch_size=batch)
+    })
+    model.to(device)
+    model.to(ptdtype)
     prompt = torch.tensor(enc.encode("hello", allowed_special={"<|endoftext|>"}), dtype=torch.long, device=device).unsqueeze(0)
     prompt = prompt.repeat(batch, 1)
     times = []
 
     for stage, num_steps in enumerate([10, 10]):
         for i in tqdm(range(num_steps)):
-            torch.cuda.synchronize(device=None)
+            torch.cuda.synchronize()
             torch.manual_seed(i + seed)
 
             t = time.time()
@@ -192,28 +198,26 @@ print("Third task: training throughput")
 model.train()
 for batch_size in [4, 12]:
     times = []
-    torch.cuda.synchronize()
     for stage, num_steps in enumerate([2, 10]): # burnin, then benchmark
         for k in tqdm(range(num_steps)):
-            optimizer.zero_grad(set_to_none=True)
-            X, Y = get_batch('train')
+            torch.cuda.synchronize()
             t0 = time.time()
-            with ctx:
-                logits, loss = model(X, Y)
-            loss.backward()
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(gradient_accumulation_steps):
+                X, Y = get_batch('train')
+                with ctx:
+                    logits, loss = model(X, Y)
+                loss.backward()
             optimizer.step()
-            lossf = loss.item()
-            print(f"{k}/{num_steps} loss: {lossf:.4f}")
             t1 = time.time()
             dt = t1-t0
             if stage == 1:
                 times.append(dt)
-        torch.cuda.synchronize()
         mfu = model.estimate_mfu(batch_size * 1 * num_steps, dt)
         if stage == 1:
             print(f"time per iteration: {dt/num_steps*1000:.4f}ms, MFU: {mfu*100:.2f}%")
-    print(f"training_throughput_{batch_size}", batch_size / np.mean(times))
-    result[f"training_throughput_{batch_size}"] = batch_size / np.mean(times)
+    print(f"training_throughput_{batch_size}", batch_size * block_size * gradient_accumulation_steps / np.mean(times))
+    result[f"training_throughput_{batch_size}"] = batch_size * block_size * gradient_accumulation_steps / np.mean(times)
 
 # now batch size should be 12
 batch_size = 12

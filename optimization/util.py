@@ -39,10 +39,11 @@ def decode_one_token(model, idx, pos, temperature=1.0, top_k=None):
         return probs
 
 def decode_n_tokens(model, idx, pos, num_new_tokens, device, temperature=1.0, top_k=None):
+    raise NotImplementedError("decode n tokens is not implemented.")
     idx_next = idx
-    pos = torch.tensor(pos, dtype=torch.long, device=device)
-    new_tokens = torch.empty(num_new_tokens, dtype=torch.long, device=device)
-    new_probs = torch.empty(num_new_tokens, model.config.vocab_size, device=device)
+    pos = torch.tensor([pos], dtype=torch.long, device=device)
+    new_tokens = torch.empty(1, num_new_tokens, dtype=torch.long, device=device)
+    new_probs = torch.empty(1, num_new_tokens, model.config.vocab_size, device=device)
 
     for i in range(num_new_tokens):
         probs = decode_one_token(
@@ -54,9 +55,9 @@ def decode_n_tokens(model, idx, pos, num_new_tokens, device, temperature=1.0, to
             idx_next = torch.multinomial(probs, num_samples=1)
         
         pos += 1
-        new_tokens[i] = idx_next
-        new_probs[i] = probs
+        new_tokens[:,i] = idx_next
+        new_probs[:,i] = probs
     return new_tokens, new_probs
 
 # prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
-# decode_one_token = torch.compile(decode_one_token, mode='reduce-overhead', fullgraph=True)
+decode_one_token = torch.compile(decode_one_token, mode='reduce-overhead', fullgraph=True)
